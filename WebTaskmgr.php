@@ -235,13 +235,13 @@ function action_config_set(array $APP_CONFIG): void
 {
   header("Content-Type: application/json; charset=utf-8");
 
+  // POST必須のエンドポイントなのでCSRFを強制
+  require_csrf();
+
   $raw = file_get_contents("php://input");
   $j = json_decode($raw, true);
   if (!is_array($j)) {
-    echo json_encode(
-      ["ok" => false, "error" => "bad json"],
-      JSON_UNESCAPED_UNICODE
-    );
+    echo json_encode(["ok" => false, "error" => "bad json"], JSON_UNESCAPED_UNICODE);
     exit();
   }
 
@@ -261,9 +261,7 @@ function action_config_set(array $APP_CONFIG): void
     $new["PASSWORD_HASH"] = password_hash($npw, PASSWORD_DEFAULT);
     $w = cfg_write($new);
     echo json_encode(
-      $w["ok"]
-        ? ["ok" => true]
-        : ["ok" => false, "error" => $w["error"] ?? "write failed"],
+      $w["ok"] ? ["ok" => true] : ["ok" => false, "error" => $w["error"] ?? "write failed"],
       JSON_UNESCAPED_UNICODE
     );
     exit();
@@ -272,9 +270,7 @@ function action_config_set(array $APP_CONFIG): void
     $new["PASSWORD_HASH"] = null;
     $w = cfg_write($new);
     echo json_encode(
-      $w["ok"]
-        ? ["ok" => true]
-        : ["ok" => false, "error" => $w["error"] ?? "write failed"],
+      $w["ok"] ? ["ok" => true] : ["ok" => false, "error" => $w["error"] ?? "write failed"],
       JSON_UNESCAPED_UNICODE
     );
     exit();
@@ -301,25 +297,19 @@ function action_config_set(array $APP_CONFIG): void
           $b >= 0 &&
           $b <= (strpos($s, ":") !== false ? 128 : 32);
         if (!$ok) {
-          echo json_encode(
-            ["ok" => false, "error" => "CIDR不正: {$rawIp}"],
-            JSON_UNESCAPED_UNICODE
-          );
+          echo json_encode(["ok" => false, "error" => "CIDR不正: {$rawIp}"], JSON_UNESCAPED_UNICODE);
           exit();
         }
       } else {
         if (filter_var($rawIp, FILTER_VALIDATE_IP) === false) {
-          echo json_encode(
-            ["ok" => false, "error" => "IP不正: {$rawIp}"],
-            JSON_UNESCAPED_UNICODE
-          );
+          echo json_encode(["ok" => false, "error" => "IP不正: {$rawIp}"], JSON_UNESCAPED_UNICODE);
           exit();
         }
       }
       $norm[] = $rawIp;
     }
 
-    // ロックアウトされんように念のため自分のIPを追加
+    // ロックアウト防止
     $me = client_ip();
     if ($me && !is_ip_allowed($me, $norm)) {
       $norm[] = $me;
@@ -336,16 +326,99 @@ function action_config_set(array $APP_CONFIG): void
     );
     exit();
   } else {
-    echo json_encode(
-      ["ok" => false, "error" => "unknown change"],
-      JSON_UNESCAPED_UNICODE
-    );
+    echo json_encode(["ok" => false, "error" => "unknown change"], JSON_UNESCAPED_UNICODE);
+    exit();
+  }
+}
+
+// CSRF攻撃対策
+function csrf_token(): string
+{
+  if (session_status() !== PHP_SESSION_ACTIVE) { @session_start(); }
+  if (empty($_SESSION['atkfm_csrf'])) {
+    $_SESSION['atkfm_csrf'] = bin2hex(random_bytes(32));
+  }
+  $val = $_SESSION['atkfm_csrf'];
+  $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on');
+  @setcookie(
+    'ATKFM_CSRF',
+    $val,
+    [
+      'path'     => '/',
+      'secure'   => $secure,
+      'httponly' => false,
+      'samesite' => 'Strict',
+    ]
+  );
+  return $val;
+}
+
+// POST時のCSRF攻撃対策
+function require_csrf(): void
+{
+  $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+  if (strtoupper($method) !== 'POST') return;
+
+  if (session_status() !== PHP_SESSION_ACTIVE) { @session_start(); }
+  $h  = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+  $ck = $_COOKIE['ATKFM_CSRF'] ?? '';
+  $ss = $_SESSION['atkfm_csrf'] ?? '';
+
+  if ($h === '' || $ck === '' || $ss === '' || !hash_equals($h, $ck) || !hash_equals($h, $ss)) {
+    http_response_code(403);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok'=>false,'error'=>'bad csrf token']);
     exit();
   }
 }
 
 // 認証
 auth_gate($APP_CONFIG);
+
+if (session_status() !== PHP_SESSION_ACTIVE) { @session_start(); }
+csrf_token();
+
+// ターミナルの場合だけ先に処理
+if (isset($_GET['action']) && str_starts_with((string)$_GET['action'], 'term-')) {
+  header("Content-Type: application/json; charset=utf-8");
+  // POST は CSRF 必須
+  if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') { require_csrf(); }
+  try {
+    $act = (string)$_GET['action'];
+    if ($act === 'term-open') {
+      $label = (string)($_POST['label'] ?? '');
+      echo json_encode(term_open($label), JSON_UNESCAPED_UNICODE);
+    } elseif ($act === 'term-list') {
+      echo json_encode(term_list(), JSON_UNESCAPED_UNICODE);
+    } elseif ($act === 'term-history') {
+      $sid = (string)($_GET['sid'] ?? '');
+      echo json_encode(term_history($sid), JSON_UNESCAPED_UNICODE);
+    } elseif ($act === 'term-run') {
+      $raw = file_get_contents('php://input');
+      $j   = json_decode($raw, true);
+      $sid = (string)($j['sid']  ?? '');
+      $inp = (string)($j['input']?? '');
+      $cols= (int)   ($j['cols'] ?? 120);
+      $rows= (int)   ($j['rows'] ?? 30);
+      echo json_encode(term_run($sid, $inp, $cols, $rows), JSON_UNESCAPED_UNICODE);
+    } elseif ($act === 'term-interrupt') {
+      $raw = file_get_contents('php://input');
+      $j   = json_decode($raw, true);
+      $sid = (string)($j['sid'] ?? '');
+      echo json_encode(term_interrupt($sid), JSON_UNESCAPED_UNICODE);
+    } elseif ($act === 'term-delete') {
+      $sid = (string)($_POST['sid'] ?? '');
+      echo json_encode(term_delete($sid), JSON_UNESCAPED_UNICODE);
+    } else {
+      http_response_code(400);
+      echo json_encode(['ok'=>false,'error'=>'unknown action'], JSON_UNESCAPED_UNICODE);
+    }
+  } catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['ok'=>false,'error'=>$e->getMessage()], JSON_UNESCAPED_UNICODE);
+  }
+  exit();
+}
 
 // 簡易ルーティング
 if (isset($_GET["action"])) {
@@ -369,6 +442,54 @@ if (isset($_GET["action"])) {
       case "config-set":
         action_config_set($APP_CONFIG);
         break;
+
+      case "term2-list":
+        header("Content-Type: application/json; charset=utf-8");
+        echo json_encode(term2_list(), JSON_UNESCAPED_UNICODE);
+        break;
+
+      case "term2-open":
+        if (function_exists('require_csrf')) { require_csrf(); }
+        header("Content-Type: application/json; charset=utf-8");
+        $cols = isset($_POST['cols']) ? max(20, (int)$_POST['cols']) : 120;
+        $rows = isset($_POST['rows']) ? max(10, (int)$_POST['rows']) : 30;
+        echo json_encode(term2_open($cols, $rows), JSON_UNESCAPED_UNICODE);
+        break;
+
+      case "term2-write":
+        if (function_exists('require_csrf')) { require_csrf(); }
+        header("Content-Type: application/json; charset=utf-8");
+        $raw = file_get_contents("php://input");
+        $j = json_decode($raw, true);
+        $sid = (string)($j['sid'] ?? '');
+        $b64 = (string)($j['data_b64'] ?? '');
+        echo json_encode(term2_write($sid, $b64), JSON_UNESCAPED_UNICODE);
+        break;
+
+      case "term2-read":
+        header("Content-Type: application/json; charset=utf-8");
+        $sid = (string)($_GET['sid'] ?? '');
+        echo json_encode(term2_read($sid), JSON_UNESCAPED_UNICODE);
+        break;
+
+      case "term2-resize":
+        if (function_exists('require_csrf')) { require_csrf(); }
+        header("Content-Type: application/json; charset=utf-8");
+        $raw = file_get_contents("php://input");
+        $j = json_decode($raw, true);
+        $sid = (string)($j['sid'] ?? '');
+        $cols = max(20, (int)($j['cols'] ?? 120));
+        $rows = max(10, (int)($j['rows'] ?? 30));
+        echo json_encode(term2_resize($sid, $cols, $rows), JSON_UNESCAPED_UNICODE);
+        break;
+
+      case "term2-close":
+        if (function_exists('require_csrf')) { require_csrf(); }
+        header("Content-Type: application/json; charset=utf-8");
+        $sid = (string)($_POST['sid'] ?? '');
+        echo json_encode(term2_close($sid), JSON_UNESCAPED_UNICODE);
+        break;
+
       default:
         http_response_code(400);
         echo json_encode(["ok" => false, "error" => "unknown action"]);
@@ -899,6 +1020,21 @@ function is_windows(): bool
   return stripos(PHP_OS, "WIN") === 0 ||
     (defined("PHP_OS_FAMILY") && PHP_OS_FAMILY === "Windows");
 }
+function current_user_name(): string
+{
+  $u = '';
+  if (is_windows()) {
+    $u = getenv('USERNAME') ?: '';
+  } else {
+    $u = getenv('USER') ?: '';
+    if ($u === '') {
+      $out = []; $rc = 0; @exec('id -un 2>/dev/null', $out, $rc);
+      if ($rc === 0 && !empty($out)) $u = trim($out[0]);
+    }
+  }
+  if ($u === '') { $u = get_current_user() ?: 'user'; }
+  return $u;
+}
 function which(string $cmd): ?string
 {
   $out = [];
@@ -1192,6 +1328,7 @@ function static_info(): array
     "OS" => php_uname("s"),
     "Host" => php_uname("n"),
     "Kernel" => php_uname("r"),
+    "User" => current_user_name(),
     "Shell" => is_windows()
       ? (getenv("ComSpec") ?:
       "cmd.exe")
@@ -1322,6 +1459,425 @@ function signal_process(int $pid, string $sig): array
   return $rc === 0
     ? ["ok" => true, "message" => implode("\n", $out)]
     : ["ok" => false, "error" => implode("\n", $out)];
+}
+
+// ターミナル関連関数
+function default_shell(): string
+{
+  if (is_windows()) {
+    return getenv('ComSpec') ?: 'cmd.exe';
+  }
+  $sh = getenv('SHELL');
+  if ($sh) return $sh;
+  $b = which('bash');
+  if ($b) return $b;
+  $s = which('sh');
+  return $s ?: '/bin/sh';
+}
+function term_state_init(): void
+{
+  if (session_status() !== PHP_SESSION_ACTIVE) { @session_start(); }
+  if (empty($_SESSION['atk_term']) || !is_array($_SESSION['atk_term'])) {
+    $_SESSION['atk_term'] = [ 'tabs' => [] ];
+  }
+}
+function term_open(string $label = ''): array
+{
+  term_state_init();
+  $sid = bin2hex(random_bytes(8));
+  $cwd = $_SESSION['cd'] ?? (getcwd() ?: '/');
+  $tab = [
+    'id'    => $sid,
+    'label' => ($label !== '' ? $label : ('Tab ' . (count($_SESSION['atk_term']['tabs']) + 1))),
+    'cwd'   => $cwd,
+    'log'   => [
+      ['ts'=>time(),'type'=>'system','out'=>"Opened at ".date('c')." (cwd={$cwd})"]
+    ],
+  ];
+  $_SESSION['atk_term']['tabs'][$sid] = $tab;
+  return ['ok'=>true, 'sid'=>$sid, 'tab'=>$tab];
+}
+function term_list(): array
+{
+  term_state_init();
+  $tabs = [];
+  foreach ($_SESSION['atk_term']['tabs'] as $t) {
+    $tabs[] = ['id'=>$t['id'], 'label'=>$t['label'], 'cwd'=>$t['cwd']];
+  }
+  return ['ok'=>true, 'tabs'=>$tabs];
+}
+function term_history(string $sid): array
+{
+  term_state_init();
+  $t = $_SESSION['atk_term']['tabs'][$sid] ?? null;
+  if (!$t) return ['ok'=>false, 'error'=>'notfound'];
+  return ['ok'=>true, 'tab'=>$t];
+}
+function term_delete(string $sid): array
+{
+  term_state_init();
+  if (isset($_SESSION['atk_term']['tabs'][$sid])) {
+    unset($_SESSION['atk_term']['tabs'][$sid]);
+    return ['ok'=>true];
+  }
+  return ['ok'=>false, 'error'=>'notfound'];
+}
+
+function term2_ensure_session(){
+  if (session_status() !== PHP_SESSION_ACTIVE) @session_start();
+  if (empty($_SESSION['atk_term2'])) $_SESSION['atk_term2'] = ['tabs'=>[]];
+}
+function term2_tmux_path(): ?string {
+  $p = which('tmux');
+  return $p && is_file($p) ? $p : null;
+}
+function term2_err($msg){ return ['ok'=>false, 'error'=>$msg]; }
+function term2_list(): array {
+  term2_ensure_session();
+  $tabs = $_SESSION['atk_term2']['tabs'] ?? [];
+  $tmux = term2_tmux_path();
+  if ($tmux) {
+    foreach ($tabs as $sid => $t) {
+      $name = $t['name'] ?? '';
+      if ($name === '') { unset($tabs[$sid]); continue; }
+      $out = []; $rc = 0; @exec($tmux.' has-session -t '.escapeshellarg($name).' 2>/dev/null', $out, $rc);
+      if ($rc !== 0) unset($tabs[$sid]);
+    }
+  }
+  $_SESSION['atk_term2']['tabs'] = $tabs;
+  $outTabs = [];
+  foreach ($tabs as $sid=>$t) {
+    $outTabs[] = ['id'=>$sid, 'label'=>$t['label'] ?? $sid];
+  }
+  return ['ok'=>true, 'tabs'=>$outTabs];
+}
+
+function term2_open(int $cols, int $rows): array {
+  if (!is_linux()) return term2_err('Linux以外では利用できません。');
+  $tmux = term2_tmux_path();
+  if (!$tmux) return term2_err('tmux が見つかりません（apt/yum で tmux を導入してください）。');
+
+  term2_ensure_session();
+
+  $sid  = 't'.substr(base_convert((string)time(),10,36), -6).bin2hex(random_bytes(2));
+  $name = 'atkfm_'.$sid;
+
+  $cwd   = isset($_SESSION['cd']) ? $_SESSION['cd'] : (rtrim(realpath("."), DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR);
+  $shell = getenv('SHELL') ?: '/bin/bash';
+  $ps1   = "[\\u@\\h \\w]# ";
+
+  $cmd    = 'sh -lc '.escapeshellarg('export TERM=xterm-256color; export PS1="'.$ps1.'"; exec '.escapeshellarg($shell).' -i -l');
+  $create = $tmux.' new-session -d -s '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' -c '.escapeshellarg($cwd).' '.$cmd.' 2>&1';
+  $out = []; $rc = 0; @exec($create, $out, $rc);
+  if ($rc !== 0) return term2_err('tmux new-session 失敗: '.implode("\n",$out));
+  @exec($tmux.' set-option  -t '.escapeshellarg($name).' status off 2>&1');
+  @exec($tmux.' set-option  -t '.escapeshellarg($name).' window-size manual 2>&1');
+  @exec($tmux.' resize-window -t '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' 2>&1');
+
+  $_SESSION['atk_term2']['tabs'][$sid] = [
+    'name'=>$name,
+    'label'=>$name,
+    'created'=>time(),
+    'hist_lines'=>0,
+  ];
+  return ['ok'=>true, 'sid'=>$sid];
+}
+
+function term2_validate_sid(string $sid): ?string {
+  term2_ensure_session();
+  if (!preg_match('/^[A-Za-z0-9]+$/', $sid)) return null;
+  $t = $_SESSION['atk_term2']['tabs'][$sid] ?? null;
+  return $t['name'] ?? null;
+}
+
+function term2_read(string $sid): array {
+  if (!is_linux()) return term2_err('Linux以外では利用できません。');
+  $tmux = term2_tmux_path();
+  if (!$tmux) return term2_err('tmux が見つかりません。');
+  $name = term2_validate_sid($sid);
+  if (!$name) return term2_err('invalid sid');
+
+  $fmt = '#{pane_height} #{pane_width} #{cursor_y} #{cursor_x}';
+  $o = []; $rc = 0;
+  @exec($tmux.' display-message -p -t '.escapeshellarg($name).' "'.$fmt.'" 2>/dev/null', $o, $rc);
+  $h=$w=$cy=$cx = 0;
+  if ($rc===0 && !empty($o)) {
+    $parts = preg_split('/\s+/', trim($o[0]));
+    $h = max(1, (int)($parts[0] ?? 0));
+    $w = max(1, (int)($parts[1] ?? 0));
+    $cy = max(0, (int)($parts[2] ?? 0));
+    $cx = max(0, (int)($parts[3] ?? 0));
+  } else {
+    $h = 24; $w = 80; $cy = 0; $cx = 0;
+  }
+
+  $lines = []; $rc = 0;
+  $cap = $tmux.' capture-pane -p -e -J -t '.escapeshellarg($name).' -S - -E -';
+  @exec($cap.' 2>/dev/null', $lines, $rc);
+  if ($rc !== 0 || !is_array($lines)) $lines = [];
+
+  if (count($lines) > $h) {
+    $lines = array_slice($lines, -$h);
+  } else {
+    $pad = $h - count($lines);
+    if ($pad > 0) $lines = array_merge(array_fill(0, $pad, ''), $lines);
+  }
+
+  $txt = implode("\n", $lines);
+
+  if ($txt !== '') {
+    $txt = str_replace("\x0c", "", $txt);
+  }
+
+  return [
+    'ok'      => true,
+    'out_b64' => base64_encode($txt),
+    'cx'      => $cx,
+    'cy'      => $cy,
+    'w'       => $w,
+    'h'       => $h,
+  ];
+}
+
+function term2_write(string $sid, string $b64): array {
+  if (!is_linux()) return term2_err('Linux以外では利用できません。');
+  $tmux = term2_tmux_path();
+  if (!$tmux) return term2_err('tmux が見つかりません。');
+  $name = term2_validate_sid($sid);
+  if (!$name) return term2_err('invalid sid');
+
+  $data = base64_decode($b64, true);
+  if ($data===false) return term2_err('bad base64');
+
+  // 任意バイトをそのまま注入する
+  $tmp = tempnam(sys_get_temp_dir(), 'atkfm_term_');
+  file_put_contents($tmp, $data);
+  $buf = 'atkfm_buf_'.$sid.'_'.bin2hex(random_bytes(2));
+  $out=[]; $rc=0;
+  @exec($tmux.' load-buffer -b '.escapeshellarg($buf).' '.escapeshellarg($tmp).' 2>&1', $out, $rc);
+  if ($rc===0) @exec($tmux.' paste-buffer -t '.escapeshellarg($name).' -b '.escapeshellarg($buf).' 2>&1', $out, $rc);
+  @exec($tmux.' delete-buffer -b '.escapeshellarg($buf).' 2>&1');
+  @unlink($tmp);
+  if ($rc!==0) return term2_err('write failed');
+  return ['ok'=>true];
+}
+
+function term2_resize(string $sid, int $cols, int $rows): array {
+  if (!is_linux()) return term2_err('Linux以外では利用できません。');
+  $tmux = term2_tmux_path();
+  if (!$tmux) return term2_err('tmux が見つかりません。');
+  $name = term2_validate_sid($sid);
+  if (!$name) return term2_err('invalid sid');
+
+  $out=[]; $rc=0;
+  @exec($tmux.' resize-window -t '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' 2>&1', $out, $rc);
+  return $rc===0 ? ['ok'=>true] : term2_err('resize failed: '.implode("\n",$out));
+}
+
+function term2_close(string $sid): array {
+  if (!is_linux()) return term2_err('Linux以外では利用できません。');
+  $tmux = term2_tmux_path();
+  if (!$tmux) return term2_err('tmux が見つかりません。');
+  $name = term2_validate_sid($sid);
+  if (!$name) return term2_err('invalid sid');
+
+  $out=[]; $rc=0; @exec($tmux.' kill-session -t '.escapeshellarg($name).' 2>&1', $out, $rc);
+  term2_ensure_session();
+  unset($_SESSION['atk_term2']['tabs'][$sid]);
+  return ['ok'=> $rc===0];
+}
+
+function sanitize_interactive_fallback(string $cmd): string
+{
+  $trim = ltrim($cmd);
+  if (preg_match('/^top(\s|$)/', $trim) && !preg_match('/\s-b(\s|$)/', $trim)) {
+    if (!preg_match('/\s-n\s+\d+/', $trim)) {
+      $cmd .= ' -b -n 1';
+    } else {
+      $cmd .= ' -b';
+    }
+  }
+  if (preg_match('/^\s*(less|more|vi|vim|nano|htop|watch|man|ssh)(\s|$)/', $trim)) {
+    $cmd = 'printf "This command is interactive and not supported in fallback mode.\n"';
+  }
+  return $cmd;
+}
+
+function term_run(string $sid, string $input, int $cols = 120, int $rows = 30): array
+{
+  term_state_init();
+  if (!isset($_SESSION['atk_term']['tabs'][$sid])) {
+    return ['ok'=>false, 'error'=>'notfound'];
+  }
+
+  // 必要情報を確保して即セッションロック解放
+  $t = $_SESSION['atk_term']['tabs'][$sid];
+  $cwd = $t['cwd'];
+  $cmd = trim($input);
+  if ($cmd === '') {
+    return ['ok'=>true, 'out'=>'', 'cwd'=>$cwd];
+  }
+  if (session_status() === PHP_SESSION_ACTIVE) {
+    @session_write_close();
+  }
+
+  $env = ['TERM' => 'dumb'];
+  if (!is_windows()) {
+    $cmd = sanitize_interactive_fallback($cmd);
+  }
+
+  $wrapped = is_windows()
+    ? ('cd /d ' . escapeshellarg($cwd) . ' & ' . $cmd . ' & echo __PWD__=%cd%')
+    : ('cd ' . escapeshellarg($cwd) . '; ' . $cmd . '; printf "\n__PWD__=%s\n" "$PWD"');
+
+  $des = [0=>['pipe','r'], 1=>['pipe','w'], 2=>['pipe','w']];
+
+  if (is_windows()) {
+    $cm = getenv('ComSpec') ?: 'cmd.exe';
+    $proc = @proc_open($cm.' /C '.$wrapped, $des, $pipes, $cwd);
+  } else {
+    $shell = default_shell();
+    $proc  = @proc_open($shell.' -lc '.escapeshellarg($wrapped), $des, $pipes, $cwd, $env);
+  }
+
+  if (!is_resource($proc)) {
+    return ['ok'=>false, 'error'=>'spawn failed'];
+  }
+
+  fclose($pipes[0]);
+  stream_set_blocking($pipes[1], false);
+  stream_set_blocking($pipes[2], false);
+
+  $status = @proc_get_status($proc);
+  $pid = (int)($status['pid'] ?? 0);
+  if ($pid > 0) term_record_pid($sid, $pid);
+
+  $buf = '';
+  while (true) {
+    $status = @proc_get_status($proc);
+    $running = $status && !empty($status['running']);
+
+    $r1 = @fread($pipes[1], 65536);
+    $r2 = @fread($pipes[2], 65536);
+    if ($r1 !== false && $r1 !== '') $buf .= $r1;
+    if ($r2 !== false && $r2 !== '') $buf .= $r2;
+
+    if (!$running) break;
+    usleep(100000); // 100ms
+  }
+
+  if (is_resource($pipes[1])) fclose($pipes[1]);
+  if (is_resource($pipes[2])) fclose($pipes[2]);
+  @proc_close($proc);
+  term_clear_pid($sid);
+
+  $newCwd = $cwd;
+  if (preg_match('/^__PWD__\s*=\s*(.+)\s*$/m', $buf, $m)) {
+    $newCwd = rtrim($m[1]);
+    $buf = preg_replace('/^__PWD__\s*=\s*.+\s*$/m', '', $buf);
+  }
+
+  @session_start();
+  term_state_init();
+  if (isset($_SESSION['atk_term']['tabs'][$sid])) {
+    $_SESSION['atk_term']['tabs'][$sid]['cwd'] = $newCwd;
+    $_SESSION['atk_term']['tabs'][$sid]['log'][] = ['ts'=>time(),'type'=>'in','cmd'=>$cmd];
+    $_SESSION['atk_term']['tabs'][$sid]['log'][] = ['ts'=>time(),'type'=>'out','out'=>$buf];
+  }
+
+  return ['ok'=>true, 'out'=>$buf, 'cwd'=>$newCwd];
+}
+
+function term_fallback_pid_path(string $sid): string
+{
+  if (session_status() !== PHP_SESSION_ACTIVE) @session_start();
+  $sess = session_id() ?: 'nosess';
+  return sys_get_temp_dir() . DIRECTORY_SEPARATOR . "atkfm_termfb_{$sess}_{$sid}.json";
+}
+function term_record_pid(string $sid, int $pid): void
+{
+  $p = term_fallback_pid_path($sid);
+  @file_put_contents($p, json_encode(['pid'=>$pid, 'ts'=>time()]));
+}
+function term_get_pid(string $sid): ?int
+{
+  $p = term_fallback_pid_path($sid);
+  $j = @file_get_contents($p);
+  if ($j === false) return null;
+  $d = json_decode($j, true);
+  $pid = (int)($d['pid'] ?? 0);
+  return $pid > 0 ? $pid : null;
+}
+function term_clear_pid(string $sid): void
+{
+  @unlink(term_fallback_pid_path($sid));
+}
+
+function posix_kill_tree_int(int $pid, int $sig = 2): bool
+{
+  $killed = false;
+
+  if (!is_dir('/proc')) {
+    if (function_exists('posix_kill')) {
+      $killed = @posix_kill($pid, $sig);
+    } else {
+      $rc = 0; $out = [];
+      @exec('kill -' . intval($sig) . ' ' . intval($pid) . ' 2>/dev/null', $out, $rc);
+      $killed = ($rc === 0);
+    }
+    return $killed;
+  }
+
+  $pp = [];
+  foreach (glob('/proc/[0-9]*/stat') as $statf) {
+    $s = @file_get_contents($statf);
+    if ($s === false) continue;
+    $parts = explode(')', $s, 2);
+    if (count($parts) < 2) continue;
+    $after = trim($parts[1]);
+    $fields = preg_split('/\s+/', $after);
+    if (count($fields) < 2) continue;
+    $ppid = (int)$fields[1];
+    $cpid = (int)basename(dirname($statf));
+    $pp[$ppid][] = $cpid;
+  }
+
+  $stack = [$pid];
+  $all = [];
+  while ($stack) {
+    $p = array_pop($stack);
+    if (isset($all[$p])) continue;
+    $all[$p] = true;
+    foreach ($pp[$p] ?? [] as $ch) $stack[] = $ch;
+  }
+
+  foreach (array_keys($all) as $p) {
+    if (function_exists('posix_kill')) {
+      @posix_kill($p, $sig);
+    } else {
+      $rc = 0; $out = [];
+      @exec('kill -' . intval($sig) . ' ' . intval($p) . ' 2>/dev/null', $out, $rc);
+    }
+    $killed = true;
+  }
+  return $killed;
+}
+
+function win_kill_tree_force(int $pid): bool
+{
+  $out = []; $rc = 0;
+  @exec('taskkill /PID ' . intval($pid) . ' /T', $out, $rc);
+  return ($rc === 0);
+}
+
+function term_interrupt(string $sid): array
+{
+  $pid = term_get_pid($sid);
+  if (!$pid) return ['ok'=>false, 'error'=>'no running process'];
+  $ok = is_windows()
+    ? win_kill_tree_force($pid)
+    : posix_kill_tree_int($pid, 2); // SIGINT
+  return $ok ? ['ok'=>true] : ['ok'=>false, 'error'=>'signal failed'];
 }
 
 // ATK-FM用の内部関数
@@ -1871,6 +2427,9 @@ $IS_WINDOWS = is_windows();
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WebTaskmgr / ATK-FM v2.0.1</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 <style>
   canvas { width: 100%; height: 160px; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
@@ -1962,23 +2521,24 @@ $IS_WINDOWS = is_windows();
     -webkit-overflow-scrolling: touch;
   }
   #pageFiles .atkfm-panel { min-height: 0; }
-#pageFiles .atkfm-panel-body {
-  min-height: 0;
-  overflow: auto;
-  -webkit-overflow-scrolling: touch;
-}
+  #pageFiles .atkfm-panel-body {
+    min-height: 0;
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 </style>
 </head>
 <body class="bg-slate-900 text-slate-100">
   <header class="sticky top-0 z-50 bg-slate-950/70 backdrop-blur border-b border-slate-800">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
       <div class="text-lg font-semibold">WebTaskmgr / ATK-FM v2.0.1</div>
-<div class="flex gap-2">
-  <button id="tabOverview" class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500">全体概要</button>
-  <button id="tabProcs"    class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600">タスク管理</button>
-  <button id="tabFiles"    class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600">ファイル管理</button>
-  <button id="tabSettings" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600">設定</button>
-</div>
+      <div class="flex gap-2">
+        <button id="tabOverview" class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500">全体概要</button>
+        <button id="tabProcs"    class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600">タスク管理</button>
+        <button id="tabFiles"    class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600">ファイル管理</button>
+        <button id="tabTerminal" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600">ターミナル</button>
+        <button id="tabSettings" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600">設定</button>
+      </div>
     </div>
   </header>
 
@@ -2053,122 +2613,148 @@ $IS_WINDOWS = is_windows();
       </div>
     </section>
 
-<section id="pageFiles" class="hidden">
-<div class="mb-3 p-2 rounded border border-slate-800 bg-slate-800/40">
-  <span class="text-sm text-slate-300">ATK-FM</span>
-  <span id="fmInfo" class="ml-3 text-base font-medium text-slate-100 tracking-wide"></span>
-</div>
+    <section id="pageFiles" class="hidden">
+      <div class="mb-3 p-2 rounded border border-slate-800 bg-slate-800/40">
+        <span class="text-sm text-slate-300">ATK-FM</span>
+        <span id="fmInfo" class="ml-3 text-base font-medium text-slate-100 tracking-wide"></span>
+      </div>
 
-  <div class="atkfm-wrap grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div class="atkfm-wrap grid grid-cols-1 lg:grid-cols-2 gap-4">
 
-    <div class="rounded border border-slate-800 bg-slate-800/40 atkfm-panel">
-      <div class="atkfm-panel-head">
-        <div class="flex items-center justify-between">
-          <div class="text-sm text-slate-300">クライアント操作</div>
-          <span class="atkfm-tag">新規/アップロード/リンク</span>
+        <div class="rounded border border-slate-800 bg-slate-800/40 atkfm-panel">
+          <div class="atkfm-panel-head">
+            <div class="flex items-center justify-between">
+              <div class="text-sm text-slate-300">クライアント操作</div>
+              <span class="atkfm-tag">新規/アップロード/リンク</span>
+            </div>
+          </div>
+          <div class="atkfm-panel-body">
+            <form onsubmit="fm.addFile(); return false;" class="space-y-2 mb-3">
+              <label class="block text-xs text-slate-400 mb-1">ファイル名</label>
+              <div class="flex flex-wrap gap-2">
+                <input type="text" id="fm-add-file" value="example.txt" class="atkfm-input" />
+                <button type="button" onclick="fm.addFile()" class="atkfm-btn">新規作成</button>
+              </div>
+            </form>
+
+            <form onsubmit="fm.addDir(); return false;" class="space-y-2 mb-3">
+              <label class="block text-xs text-slate-400 mb-1">ディレクトリ名</label>
+              <div class="flex flex-wrap gap-2">
+                <input type="text" id="fm-add-dir" value="example/" class="atkfm-input" />
+                <button type="button" onclick="fm.addDir()" class="atkfm-btn">新規作成</button>
+              </div>
+            </form>
+
+            <form id="fm-upload-form" enctype="multipart/form-data" class="space-y-2 mb-3" onsubmit="fm.upload(); return false;">
+              <label class="block text-xs text-slate-400 mb-1">アップロード</label>
+              <div class="flex flex-wrap gap-2 items-center">
+                <input type="file" id="fm-upload-files" name="file[]" multiple class="text-sm file:mr-3 file:atkfm-btn" />
+                <button type="button" onclick="fm.upload()" class="atkfm-btn atkfm-btn--accent">保存</button>
+              </div>
+            </form>
+
+            <form id="fm-chunk-form" class="space-y-2 mb-3" onsubmit="fm.chunkUpload(); return false;">
+             <label class="block text-xs text-slate-400 mb-1">分割アップロード</label>
+              <div class="flex flex-wrap gap-2 items-center">
+                <span class="text-sm">チャンク</span>
+                <input type="number" id="fm-chunk-mb" value="3" class="atkfm-input" style="width:72px" />
+                <span class="text-sm">MB</span>
+                <input type="file" id="fm-chunk-file" class="text-sm" />
+                <button type="submit" class="atkfm-btn atkfm-btn--accent">保存</button>
+              </div>
+            </form>
+
+            <form onsubmit="fm.uploadFromUrl(); return false;" class="space-y-2 mb-3">
+              <label class="block text-xs text-slate-400 mb-1">URLからアップロード</label>
+              <div class="atkfm-inline">
+                <input type="text" id="fm-url" placeholder="URLを入力してください" class="atkfm-input" />
+                <button type="button" onclick="fm.uploadFromUrl()" class="atkfm-btn atkfm-btn--accent">保存</button>
+              </div>
+            </form>
+
+            <form onsubmit="fm.makeLink(); return false;" class="space-y-2 mb-4">
+              <label class="block text-xs text-slate-400 mb-1">このフォルダーへのショートカット</label>
+              <div class="atkfm-inline">
+                <input type="text" id="fm-linkto" value="" class="atkfm-input" />
+                <button type="button" onclick="fm.makeLink()" class="atkfm-btn">作成</button>
+              </div>
+            </form>
+
+            <hr class="my-3 border-slate-700">
+
+            <div>
+              <div class="text-xs text-slate-400">デバッグ情報</div>
+              <pre id="fmDebug" class="text-xs whitespace-pre-wrap mt-1"></pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="rounded border border-slate-800 bg-slate-800/40 atkfm-panel">
+          <div class="atkfm-panel-head">
+            <form onsubmit="fm.list(); return false;" class="flex flex-wrap items-center gap-2 text-sm">
+              <input
+                type="text"
+                id="fm-root"
+                value="<?= htmlspecialchars(
+                  isset($_SESSION["cd"])
+                    ? $_SESSION["cd"]
+                    : rtrim(realpath("."), DIRECTORY_SEPARATOR) .
+                      DIRECTORY_SEPARATOR
+                ) ?>"
+                class="atkfm-input flex-1 min-w-[220px]"
+                />
+              <button type="button" onclick="fm.list()" class="atkfm-btn atkfm-btn--accent">送信</button>
+              <button type="button" onclick="fm.up()" class="atkfm-btn">上へ</button>
+              <button type="button" onclick="fm.count()" class="atkfm-btn">詳細</button>
+              <button type="button" onclick="fm.viewList()" class="atkfm-btn">閲覧</button>
+            </form>
+          </div>
+          <div class="atkfm-panel-body">
+            <div id="fm-list" class="text-sm space-y-1"></div>
+          </div>
         </div>
       </div>
-      <div class="atkfm-panel-body">
-        <form onsubmit="fm.addFile(); return false;" class="space-y-2 mb-3">
-          <label class="block text-xs text-slate-400 mb-1">ファイル名</label>
-          <div class="flex flex-wrap gap-2">
-            <input type="text" id="fm-add-file" value="example.txt" class="atkfm-input" />
-            <button type="button" onclick="fm.addFile()" class="atkfm-btn">新規作成</button>
-          </div>
-        </form>
 
-        <form onsubmit="fm.addDir(); return false;" class="space-y-2 mb-3">
-          <label class="block text-xs text-slate-400 mb-1">ディレクトリ名</label>
-          <div class="flex flex-wrap gap-2">
-            <input type="text" id="fm-add-dir" value="example/" class="atkfm-input" />
-            <button type="button" onclick="fm.addDir()" class="atkfm-btn">新規作成</button>
-          </div>
-        </form>
-
-        <form id="fm-upload-form" enctype="multipart/form-data" class="space-y-2 mb-3" onsubmit="fm.upload(); return false;">
-          <label class="block text-xs text-slate-400 mb-1">アップロード</label>
-          <div class="flex flex-wrap gap-2 items-center">
-            <input type="file" id="fm-upload-files" name="file[]" multiple class="text-sm file:mr-3 file:atkfm-btn" />
-            <button type="button" onclick="fm.upload()" class="atkfm-btn atkfm-btn--accent">保存</button>
-          </div>
-        </form>
-
-        <form id="fm-chunk-form" class="space-y-2 mb-3" onsubmit="fm.chunkUpload(); return false;">
-          <label class="block text-xs text-slate-400 mb-1">分割アップロード</label>
-          <div class="flex flex-wrap gap-2 items-center">
-            <span class="text-sm">チャンク</span>
-            <input type="number" id="fm-chunk-mb" value="3" class="atkfm-input" style="width:72px" />
-            <span class="text-sm">MB</span>
-            <input type="file" id="fm-chunk-file" class="text-sm" />
-            <button type="submit" class="atkfm-btn atkfm-btn--accent">保存</button>
-          </div>
-        </form>
-
-        <form onsubmit="fm.uploadFromUrl(); return false;" class="space-y-2 mb-3">
-          <label class="block text-xs text-slate-400 mb-1">URLからアップロード</label>
-          <div class="atkfm-inline">
-            <input type="text" id="fm-url" placeholder="URLを入力してください" class="atkfm-input" />
-            <button type="button" onclick="fm.uploadFromUrl()" class="atkfm-btn atkfm-btn--accent">保存</button>
-          </div>
-        </form>
-
-        <form onsubmit="fm.makeLink(); return false;" class="space-y-2 mb-4">
-          <label class="block text-xs text-slate-400 mb-1">このフォルダーへのショートカット</label>
-          <div class="atkfm-inline">
-            <input type="text" id="fm-linkto" value="" class="atkfm-input" />
-            <button type="button" onclick="fm.makeLink()" class="atkfm-btn">作成</button>
-          </div>
-        </form>
-
-        <hr class="my-3 border-slate-700">
-
-        <div>
-          <div class="text-xs text-slate-400">デバッグ情報</div>
-          <pre id="fmDebug" class="text-xs whitespace-pre-wrap mt-1"></pre>
+    <div id="fm-modal" class="hidden fixed inset-0 z-50" role="dialog" aria-modal="true" aria-labelledby="fm-modal-title">
+      <div class="absolute inset-0 bg-black/60" id="fm-modal-backdrop"></div>
+      <div class="relative mx-auto my-10 w-[95%] max-w-4xl rounded-lg border border-slate-800 bg-slate-950 shadow-xl">
+        <div class="flex items-center justify-between border-b border-slate-800 p-4">
+          <h2 id="fm-modal-title" class="text-lg font-semibold text-slate-200">操作</h2>
+          <button onclick="fm.closeModal()" class="atkfm-btn" aria-label="閉じる">×</button>
+        </div>
+        <div class="p-4 space-y-3">
+          <input id="fm-selected" type="text" class="atkfm-input w-full" readonly />
+          <div id="fm-actions" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>
         </div>
       </div>
     </div>
+  </section>
 
-    <div class="rounded border border-slate-800 bg-slate-800/40 atkfm-panel">
-      <div class="atkfm-panel-head">
-        <form onsubmit="fm.list(); return false;" class="flex flex-wrap items-center gap-2 text-sm">
-          <input
-            type="text"
-            id="fm-root"
-            value="<?= htmlspecialchars(
-              isset($_SESSION["cd"])
-                ? $_SESSION["cd"]
-                : rtrim(realpath("."), DIRECTORY_SEPARATOR) .
-                  DIRECTORY_SEPARATOR
-            ) ?>"
-            class="atkfm-input flex-1 min-w-[220px]"
-            />
-          <button type="button" onclick="fm.list()" class="atkfm-btn atkfm-btn--accent">送信</button>
-          <button type="button" onclick="fm.up()" class="atkfm-btn">上へ</button>
-          <button type="button" onclick="fm.count()" class="atkfm-btn">詳細</button>
-          <button type="button" onclick="fm.viewList()" class="atkfm-btn">閲覧</button>
-        </form>
-      </div>
-      <div class="atkfm-panel-body">
-        <div id="fm-list" class="text-sm space-y-1"></div>
+<section id="pageTerminal" class="space-y-3 hidden">
+  <div class="p-3 rounded border border-slate-800 bg-slate-800/40">
+    <div class="flex items-center justify-between">
+      <div class="text-sm text-slate-300">ターミナル</div>
+      <div class="flex items-center gap-2">
+        <label class="text-xs text-slate-400">Font</label>
+        <select id="term-font" class="atkfm-input" style="width:84px">
+          <option value="12">12px</option>
+          <option value="13">13px</option>
+          <option value="14" selected>14px</option>
+          <option value="16">16px</option>
+          <option value="18">18px</option>
+          <option value="20">20px</option>
+        </select>
+        <button type="button" id="term-newtab" class="atkfm-btn" onclick="term.newTab()">+ 新しいタブ</button>
       </div>
     </div>
   </div>
 
-<div id="fm-modal" class="hidden fixed inset-0 z-50" role="dialog" aria-modal="true" aria-labelledby="fm-modal-title">
-  <div class="absolute inset-0 bg-black/60" id="fm-modal-backdrop"></div>
-  <div class="relative mx-auto my-10 w-[95%] max-w-4xl rounded-lg border border-slate-800 bg-slate-950 shadow-xl">
-    <div class="flex items-center justify-between border-b border-slate-800 p-4">
-      <h2 id="fm-modal-title" class="text-lg font-semibold text-slate-200">操作</h2>
-      <button onclick="fm.closeModal()" class="atkfm-btn" aria-label="閉じる">×</button>
-    </div>
-    <div class="p-4 space-y-3">
-      <input id="fm-selected" type="text" class="atkfm-input w-full" readonly />
-      <div id="fm-actions" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>
+  <div class="rounded border border-slate-800 bg-slate-800/40 p-3">
+    <div id="term-tabs" class="flex flex-wrap gap-2"></div>
+    <div id="xterm-wrap" class="mt-2 rounded border border-slate-800 bg-black" style="height:60vh; overflow:hidden;">
+      <div id="xterm" style="height:100%;"></div>
     </div>
   </div>
-</div>
-
 </section>
 
 <section id="pageSettings" class="space-y-4 hidden">
@@ -2205,8 +2791,14 @@ $IS_WINDOWS = is_windows();
     <div class="text-m text-slate-300 mb-3">本アプリについて (免責事項)</div>
     <div class="text-m text-slate-400 mb-2">このプログラムは、あくまでも高校生が趣味で開発しているものです。</div>
     <div class="text-m text-slate-400 mb-2">すべてオープンソースであり、MITライセンスの下で自由に編集・再配布することができますが、プログラムを利用したことによって生じた一切の責任を負いません。</div>
-    <div class="text-m text-slate-400 mb-2">(c) 2025 <a href="https://x.com/ActiveTK5929" target="_blank">ActiveTK</a>. Released under the MIT License.</div>
+    <div class="text-m text-slate-400 mb-2">(c) 2025 <a href="https://profile.activetk.jp/" target="_blank">ActiveTK</a>. Released under the MIT License.</div>
   </div>
+
+  <div class="p-4 rounded border border-slate-800 bg-slate-800/40">
+    <div class="text-m text-slate-300 mb-3">クレジット</div>
+    <div class="text-m text-slate-400 mb-2">Ayato様(2025年9月): CSRFの脆弱性を報告していただきました。</div>
+  </div>
+
 </section>
 
   </main>
@@ -2214,10 +2806,7 @@ $IS_WINDOWS = is_windows();
 <script>
 const POLL_MS = 800;
 const IS_WINDOWS = <?php echo $IS_WINDOWS ? "true" : "false"; ?>;
-const STATIC_INFO = <?php echo json_encode(
-  $STATIC_INFO,
-  JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
-); ?>;
+const STATIC_INFO = <?php echo json_encode( $STATIC_INFO, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ); ?>;
 
 const state = {
   activeTab: 'overview',
@@ -2234,109 +2823,212 @@ const state = {
   fmInit: false
 };
 
+// CSRF
+(() => {
+  const orig = window.fetch;
+  window.fetch = function(input, init) {
+    init = init || {};
+    const url = (typeof input === 'string') ? input : (input?.url || '');
+    const sameOrigin = !/^https?:\/\//i.test(url) || url.startsWith(location.origin);
+    const method = (init.method || 'GET').toUpperCase();
+
+    if (sameOrigin && method !== 'GET' && method !== 'HEAD') {
+      const ck = document.cookie.split('; ').find(s => s.startsWith('ATKFM_CSRF='));
+      if (ck) {
+        const val = decodeURIComponent(ck.split('=').slice(1).join('='));
+        if (val) {
+          if (init.headers instanceof Headers) {
+            init.headers.set('X-CSRF-Token', val);
+          } else {
+            init.headers = init.headers || {};
+            init.headers['X-CSRF-Token'] = val;
+          }
+        }
+      }
+    }
+
+    return orig(input, init);
+  };
+})();
+
 // 諸々の便利関数とか
 const fmtPct = v => (v==null||isNaN(v)) ? '--%' : (v.toFixed(1)+'%');
 const fmtMiB = kb => (kb==null) ? '--' : (kb/1024).toFixed(1)+' MiB';
-const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
-function ringPush(arr,v,maxN){arr.push(v);if(arr.length>maxN)arr.shift();}
-function drawLine(canvas,data,yMaxHint=null){
-  if(!canvas) return;
-  const ctx=canvas.getContext('2d');
-  const W=canvas.width=canvas.clientWidth*window.devicePixelRatio;
-  const H=canvas.height=canvas.clientHeight*window.devicePixelRatio;
-  ctx.clearRect(0,0,W,H);
-  const N=data.length; if(N===0) return;
-  const yMax=yMaxHint ?? Math.max(100, Math.max(...data.filter(x=>isFinite(x))));
-  const yMin=0;
-  ctx.strokeStyle='#334155'; ctx.lineWidth=1; ctx.beginPath();
-  for(let y=0;y<=H;y+=H/4){ctx.moveTo(0,y);ctx.lineTo(W,y);} ctx.stroke();
-  ctx.lineWidth=Math.max(1,Math.floor(H/160)); ctx.strokeStyle='#60a5fa'; ctx.beginPath();
-  for(let i=0;i<N;i++){const x=(i/(Math.max(1,N-1)))*(W-2)+1; const v=clamp(data[i],yMin,yMax);
-    const y=H-((v-yMin)/(yMax-yMin))*(H-2)-1; if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);}
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+
+function ringPush(arr, v, maxN) {
+  arr.push(v);
+  if (arr.length > maxN) arr.shift();
+}
+
+function drawLine(canvas, data, yMaxHint = null) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width = canvas.clientWidth * window.devicePixelRatio;
+  const H = canvas.height = canvas.clientHeight * window.devicePixelRatio;
+  ctx.clearRect(0, 0, W, H);
+
+  const N = data.length;
+  if (N === 0) return;
+
+  const yMax = yMaxHint ?? Math.max(100, Math.max(...data.filter(x => isFinite(x))));
+  const yMin = 0;
+
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let y = 0; y <= H; y += H / 4) {
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+  }
+  ctx.stroke();
+
+  ctx.lineWidth = Math.max(1, Math.floor(H / 160));
+  ctx.strokeStyle = '#60a5fa';
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const x = (i / (Math.max(1, N - 1))) * (W - 2) + 1;
+    const v = clamp(data[i], yMin, yMax);
+    const y = H - ((v - yMin) / (yMax - yMin)) * (H - 2) - 1;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
   ctx.stroke();
 }
-function bytesHum(kb){ if(kb==null) return '--'; const mb=kb/1024; return mb<1024?mb.toFixed(1)+' MiB':(mb/1024).toFixed(2)+' GiB'; }
-function computeCpuPct(prev,curr){
-  if(!prev||!curr) return null;
-  const sum=a=>a.reduce((x,y)=>x+y,0);
-  const totald=sum(curr)-sum(prev);
-  const idled=(curr[3]+(curr[4]||0))-(prev[3]+(prev[4]||0));
-  if (totald<=0) return 0; return (1 - idled/totald)*100;
+
+function bytesHum(kb) {
+  if (kb == null) return '--';
+  const mb = kb / 1024;
+  return mb < 1024 ? mb.toFixed(1) + ' MiB' : (mb / 1024).toFixed(2) + ' GiB';
 }
-function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
+
+function computeCpuPct(prev, curr) {
+  if (!prev || !curr) return null;
+  const sum = a => a.reduce((x, y) => x + y, 0);
+  const totald = sum(curr) - sum(prev);
+  const idled = (curr[3] + (curr[4] || 0)) - (prev[3] + (prev[4] || 0));
+  if (totald <= 0) return 0;
+  return (1 - idled / totald) * 100;
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c]));
+}
 
 // タブ切り替えの処理
 const tabOverview = document.getElementById('tabOverview');
-const tabProcs    = document.getElementById('tabProcs');
-const tabFiles    = document.getElementById('tabFiles');
+const tabProcs = document.getElementById('tabProcs');
+const tabFiles = document.getElementById('tabFiles');
+const tabTerminal = document.getElementById('tabTerminal');
 const tabSettings = document.getElementById('tabSettings');
 
 const pageOverview = document.getElementById('pageOverview');
-const pageProcs    = document.getElementById('pageProcs');
-const pageFiles    = document.getElementById('pageFiles');
+const pageProcs = document.getElementById('pageProcs');
+const pageFiles = document.getElementById('pageFiles');
+const pageTerminal = document.getElementById('pageTerminal');
 const pageSettings = document.getElementById('pageSettings');
 
-tabOverview.addEventListener('click', ()=>setTab('overview'));
-tabProcs.addEventListener('click',    ()=>setTab('procs'));
-tabFiles.addEventListener('click',    ()=>setTab('files'));
-tabSettings.addEventListener('click', ()=>setTab('settings'));
+tabOverview.addEventListener('click', () => setTab('overview'));
+tabProcs.addEventListener('click', () => setTab('procs'));
+tabFiles.addEventListener('click', () => setTab('files'));
+tabTerminal.addEventListener('click', () => setTab('terminal'));
+tabSettings.addEventListener('click', () => setTab('settings'));
 
-function abortInFlight(){ if(state.controller){ try{state.controller.abort();}catch{} state.controller=null; } state.inFlight=false; }
-let suppressHash = false;
-function tabFromHash(){
-  const h = (location.hash || '').replace(/^#/, '');
-  return (h==='files'||h==='procs'||h==='overview'||h==='settings') ? h : 'overview';
+function abortInFlight() {
+  if (state.controller) {
+    try { state.controller.abort(); } catch {}
+    state.controller = null;
+  }
+  state.inFlight = false;
 }
-function setTab(t){
-  state.activeTab=t;
 
-  for (const [btn,on] of [
-    [tabOverview,t==='overview'],
-    [tabProcs,   t==='procs'],
-    [tabFiles,   t==='files'],
-    [tabSettings,t==='settings']
-  ]){
+let suppressHash = false;
+
+function tabFromHash() {
+  const h = (location.hash || '').replace(/^#/, '');
+  return (h === 'files' || h === 'procs' || h === 'overview' || h === 'settings' || h === 'terminal') ? h : 'overview';
+}
+
+function setTab(t) {
+  state.activeTab = t;
+
+  for (const [btn, on] of [
+    [tabOverview, t === 'overview'],
+    [tabProcs,    t === 'procs'],
+    [tabFiles,    t === 'files'],
+    [tabTerminal, t === 'terminal'],
+    [tabSettings, t === 'settings']
+  ]) {
     btn.classList.toggle('bg-blue-600', on);
     btn.classList.toggle('bg-slate-700', !on);
   }
 
-  pageOverview.classList.toggle('hidden', t!=='overview');
-  pageProcs.classList.toggle('hidden',    t!=='procs');
-  pageFiles.classList.toggle('hidden',    t!=='files');
-  pageSettings.classList.toggle('hidden', t!=='settings');
+  pageOverview.classList.toggle('hidden', t !== 'overview');
+  pageProcs.classList.toggle('hidden',    t !== 'procs');
+  pageFiles.classList.toggle('hidden',    t !== 'files');
+  pageTerminal.classList.toggle('hidden', t !== 'terminal');
+  pageSettings.classList.toggle('hidden', t !== 'settings');
 
-  if (t==='files' || t==='settings'){
+  if (t === 'files' || t === 'settings' || t === 'terminal') {
     abortInFlight();
-    if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer=null; }
+    if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   } else {
     restartPolling();
   }
 
-  if (t==='files'){
-    if (!state.fmInit) { fm.init(); }
-    else { fm.list(); }
+  if (t === 'files') {
+    if (!state.fmInit) { fm.init(); } else { fm.list(); }
+  } else if (t === 'terminal') {
+    const boot = () => {
+      if (window.term && typeof window.term.initOnce === 'function') {
+        window.term.initOnce();
+        window.term._requestFit();
+        if (!window.term.active) {
+          setTimeout(() => {
+            window.term.ensure().then(() => window.term._maybeResizePost());
+          }, 50);
+        } else {
+          window.term._maybeResizePost();
+        }
+      } else {
+        setTimeout(boot, 50);
+      }
+    };
+    boot();
+  } else if (t === 'settings') {
+    cfg.load();
   }
 
-  if (t==='settings') cfg.load();
-
-  if (!suppressHash){
-    const nh = '#'+t;
+  if (!suppressHash) {
+    const nh = '#' + t;
     if (location.hash !== nh) location.hash = nh;
   }
 }
 
-window.addEventListener('hashchange', ()=>{
-  suppressHash = true; setTab(tabFromHash()); suppressHash = false;
+window.addEventListener('hashchange', () => {
+  suppressHash = true;
+  setTab(tabFromHash());
+  suppressHash = false;
 });
 
-document.addEventListener('visibilitychange', ()=>{
-  if (document.hidden){ abortInFlight(); if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer=null; } }
-  else { if(state.activeTab!=='files') restartPolling(); }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    abortInFlight();
+    if (state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+  } else {
+    if (state.activeTab !== 'files' && state.activeTab !== 'settings' && state.activeTab !== 'terminal') {
+      restartPolling();
+    }
+  }
 });
 
 // サーバーのスペック表示用
 const sysSpec = document.getElementById('sysSpec');
-function renderStaticSpecs(){
+
+function renderStaticSpecs() {
   const entries = [
     ['Server App', STATIC_INFO.ServerApp],
     ['PHP Version', STATIC_INFO.PHPVersion],
@@ -2351,390 +3043,612 @@ function renderStaticSpecs(){
     ['GPU', STATIC_INFO.GPU],
     ['Disk', STATIC_INFO.Disk],
   ];
-  sysSpec.innerHTML='';
-  for (const [k,v] of entries){
-    const div=document.createElement('div');
-    div.innerHTML = `<div class="text-xs text-slate-400">${escapeHtml(k)}</div><div class="mono break-words">${escapeHtml(v||'--')}</div>`;
+
+  sysSpec.innerHTML = '';
+
+  for (const [k, v] of entries) {
+    const div = document.createElement('div');
+    div.innerHTML = `<div class="text-xs text-slate-400">${escapeHtml(k)}</div><div class="mono break-words">${escapeHtml(v || '--')}</div>`;
     sysSpec.appendChild(div);
   }
 }
 
 // ポーリングするところ(800msごとに更新してる)
-function restartPolling(){ abortInFlight(); if(state.pollTimer) clearInterval(state.pollTimer); tick(); state.pollTimer=setInterval(tick, POLL_MS); }
-async function tick(){
-  if (state.inFlight) return;
-  state.inFlight=true; state.controller=new AbortController(); const {signal}=state.controller;
-  try{
-    if (state.activeTab==='overview'){
-      const res=await fetch('?action=summary',{cache:'no-store',signal}); const j=await res.json(); if(j.ok) renderOverview(j);
-    } else if (state.activeTab==='procs') {
-      const res=await fetch('?action=processes',{cache:'no-store',signal}); const j=await res.json(); if(j.ok){ state.procs=j.processes||[]; renderProcesses(); }
-    }
-  }catch(e){} finally { state.inFlight=false; state.controller=null; }
+function restartPolling() {
+  abortInFlight();
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  tick();
+  state.pollTimer = setInterval(tick, POLL_MS);
 }
 
-const cpuTotalPct=document.getElementById('cpuTotalPct');
-const cpuModel=document.getElementById('cpuModel');
-const cpuChart=document.getElementById('cpuChart');
-const memText=document.getElementById('memText');
-const memBar=document.getElementById('memBar');
-const memChart=document.getElementById('memChart');
-const loadText=document.getElementById('loadText');
-const loadChart=document.getElementById('loadChart');
-const platformText=document.getElementById('platformText');
-const coresGrid=document.getElementById('coresGrid');
-const gpuSummary=document.getElementById('gpuSummary');
-const gpuCharts=document.getElementById('gpuCharts');
+async function tick() {
+  if (state.inFlight) return;
+  state.inFlight = true;
+  state.controller = new AbortController();
+  const { signal } = state.controller;
 
-function renderOverview(j){
-  platformText.textContent = `(c) 2025 ActiveTK. Released under the MIT License. - ${j.platform} @ ${new Date(j.timestamp*1000).toLocaleTimeString()}`;
-  const total=j.cpu?.total||null; const cores=j.cpu?.cores||[]; cpuModel.textContent=j.cpu?.model||'';
-  let totalPct=null;
-  if (state.lastCpu) totalPct=computeCpuPct(state.lastCpu.total,total);
-  state.lastCpuPrev={ total, cores };
+  try {
+    if (state.activeTab === 'overview') {
+      const res = await fetch('?action=summary', { cache: 'no-store', signal });
+      const j = await res.json();
+      if (j.ok) renderOverview(j);
+    } else if (state.activeTab === 'procs') {
+      const res = await fetch('?action=processes', { cache: 'no-store', signal });
+      const j = await res.json();
+      if (j.ok) {
+        state.procs = j.processes || [];
+        renderProcesses();
+      }
+    }
+  } catch (e) {
+  } finally {
+    state.inFlight = false;
+    state.controller = null;
+  }
+}
 
-  coresGrid.innerHTML='';
+const cpuTotalPct = document.getElementById('cpuTotalPct');
+const cpuModel = document.getElementById('cpuModel');
+const cpuChart = document.getElementById('cpuChart');
+const memText = document.getElementById('memText');
+const memBar = document.getElementById('memBar');
+const memChart = document.getElementById('memChart');
+const loadText = document.getElementById('loadText');
+const loadChart = document.getElementById('loadChart');
+const platformText = document.getElementById('platformText');
+const coresGrid = document.getElementById('coresGrid');
+const gpuSummary = document.getElementById('gpuSummary');
+const gpuCharts = document.getElementById('gpuCharts');
+
+function renderOverview(j) {
+  platformText.textContent = `(c) 2025 ActiveTK. Released under the MIT License. - ${j.platform} @ ${new Date(j.timestamp * 1000).toLocaleTimeString()}`;
+
+  const total = j.cpu?.total || null;
+  const cores = j.cpu?.cores || [];
+
+  cpuModel.textContent = j.cpu?.model || '';
+
+  let totalPct = null;
+  if (state.lastCpu) totalPct = computeCpuPct(state.lastCpu.total, total);
+
+  state.lastCpuPrev = { total, cores };
+  coresGrid.innerHTML = '';
+
   const prevCores = state.lastCpu?.cores || [];
-  for (let i=0;i<cores.length;i++){
-    let pct=null; if (prevCores[i]) pct=computeCpuPct(prevCores[i], cores[i]);
-    const div=document.createElement('div');
-    div.className='p-3 rounded bg-slate-800/40 border border-slate-800';
-    div.innerHTML=`<div class="text-xs text-slate-400">CPU${i}</div>
-      <div class="text-lg mono">${pct==null?'--%':pct.toFixed(1)+'%'}</div>
-      <div class="w-full h-1.5 bg-slate-700 rounded mt-2"><div class="h-1.5 bg-sky-500 rounded" style="width:${pct?clamp(pct,0,100):0}%"></div></div>`;
+  for (let i = 0; i < cores.length; i++) {
+    let pct = null;
+    if (prevCores[i]) pct = computeCpuPct(prevCores[i], cores[i]);
+
+    const div = document.createElement('div');
+    div.className = 'p-3 rounded bg-slate-800/40 border border-slate-800';
+    div.innerHTML =
+      `<div class="text-xs text-slate-400">CPU${i}</div> ` +
+      `<div class="text-lg mono">${pct == null ? '--%' : pct.toFixed(1) + '%'}</div> ` +
+      `<div class="w-full h-1.5 bg-slate-700 rounded mt-2">` +
+      `<div class="h-1.5 bg-sky-500 rounded" style="width:${pct ? clamp(pct, 0, 100) : 0}%"></div>` +
+      `</div>`;
+
     coresGrid.appendChild(div);
   }
-  state.lastCpu={ total, cores };
 
-  if (totalPct==null) totalPct=0;
+  state.lastCpu = { total, cores };
+
+  if (totalPct == null) totalPct = 0;
   cpuTotalPct.textContent = fmtPct(totalPct);
-  ringPush(state.series.cpuTotal,totalPct,state.seriesMaxPoints);
+
+  ringPush(state.series.cpuTotal, totalPct, state.seriesMaxPoints);
   drawLine(cpuChart, state.series.cpuTotal, 100);
 
-  const kbTotal=j.memory?.kb_total??null; const kbUsed=j.memory?.kb_used??null;
-  const memPct=(kbTotal && kbTotal>0 && kbUsed!=null) ? (kbUsed/kbTotal)*100 : null;
+  const kbTotal = j.memory?.kb_total ?? null;
+  const kbUsed = j.memory?.kb_used ?? null;
+  const memPct = (kbTotal && kbTotal > 0 && kbUsed != null) ? (kbUsed / kbTotal) * 100 : null;
+
   memText.textContent = `${bytesHum(kbUsed)} / ${bytesHum(kbTotal)}`;
-  memBar.style.width = `${memPct?clamp(memPct,0,100):0}%`;
-  ringPush(state.series.memPct, memPct||0, state.seriesMaxPoints);
+  memBar.style.width = `${memPct ? clamp(memPct, 0, 100) : 0}%`;
+
+  ringPush(state.series.memPct, memPct || 0, state.seriesMaxPoints);
   drawLine(memChart, state.series.memPct, 100);
 
-  const l1=j.loadavg?j.loadavg['1']:null;
-  loadText.textContent = `${l1??'--'} / ${j.loadavg?j.loadavg['5']:'--'} / ${j.loadavg?j.loadavg['15']:'--'}`;
-  ringPush(state.series.load1, l1||0, state.seriesMaxPoints);
+  const l1 = j.loadavg ? j.loadavg['1'] : null;
+  loadText.textContent = `${l1 ?? '--'} / ${j.loadavg ? j.loadavg['5'] : '--'} / ${j.loadavg ? j.loadavg['15'] : '--'}`;
+
+  ringPush(state.series.load1, l1 || 0, state.seriesMaxPoints);
+
   const yMaxLoad = Math.max(1, (cores?.length || 1));
   drawLine(loadChart, state.series.load1, yMaxLoad);
 
-  const g=j.gpus||[];
-  if (g.length===0){ gpuSummary.textContent='検出なし'; gpuCharts.innerHTML=''; }
-  else {
-    gpuSummary.textContent=g.map(x=>`#${x.index} ${x.name} ${x.util_percent??'--'}%`).join(' | ');
-    gpuCharts.innerHTML='';
-    g.forEach((gpu)=>{
-      const key=(gpu.vendor||'gpu')+':' + (gpu.index??gpu.name);
-      if (!state.series.gpu[key]) state.series.gpu[key]=[];
+  const g = j.gpus || [];
+  if (g.length === 0) {
+    gpuSummary.textContent = '検出なし';
+    gpuCharts.innerHTML = '';
+  } else {
+    gpuSummary.textContent = g.map(x => `#${x.index} ${x.name} ${x.util_percent ?? '--'}%`).join(' | ');
+    gpuCharts.innerHTML = '';
+    g.forEach((gpu) => {
+      const key = (gpu.vendor || 'gpu') + ':' + (gpu.index ?? gpu.name);
+      if (!state.series.gpu[key]) state.series.gpu[key] = [];
       ringPush(state.series.gpu[key], gpu.util_percent ?? 0, state.seriesMaxPoints);
-      const wrap=document.createElement('div');
-      wrap.innerHTML=`<div class="text-xs text-slate-300 mono mb-1">#${gpu.index} ${gpu.name} ${gpu.util_percent??'--'}% ${gpu.mem_used_mb!=null&&gpu.mem_total_mb!=null?`/ ${gpu.mem_used_mb}/${gpu.mem_total_mb} MB`:''}</div><canvas></canvas>`;
+
+      const wrap = document.createElement('div');
+      wrap.innerHTML =
+        `<div class="text-xs text-slate-300 mono mb-1">#${gpu.index} ${gpu.name} ${gpu.util_percent ?? '--'}% ${gpu.mem_used_mb != null && gpu.mem_total_mb != null ? `/ ${gpu.mem_used_mb}/${gpu.mem_total_mb} MB` : ''}</div><canvas></canvas>`;
       gpuCharts.appendChild(wrap);
       drawLine(wrap.querySelector('canvas'), state.series.gpu[key], 100);
     });
   }
 }
 
-const procBody=document.getElementById('procBody');
-const sortLabel=document.getElementById('sortLabel');
-const procCount=document.getElementById('procCount');
+const procBody = document.getElementById('procBody');
+const sortLabel = document.getElementById('sortLabel');
+const procCount = document.getElementById('procCount');
 
-function renderProcesses(){
-  const key=state.sortKey, dir=state.sortDir;
-  const arr=state.procs.slice();
-  arr.sort((a,b)=>{
-    const va=a[key], vb=b[key];
-    if(typeof va==='number' && typeof vb==='number') return dir==='asc'? va-vb : vb-va;
-    return dir==='asc'? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+function renderProcesses() {
+  const key = state.sortKey, dir = state.sortDir;
+  const arr = state.procs.slice();
+
+  arr.sort((a, b) => {
+    const va = a[key], vb = b[key];
+    if (typeof va === 'number' && typeof vb === 'number') return dir === 'asc' ? va - vb : vb - va;
+    return dir === 'asc' ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
   });
-  sortLabel.textContent = `${key} ${dir==='asc'?'▲':'▼'}`;
+
+  sortLabel.textContent = `${key} ${dir === 'asc' ? '▲' : '▼'}`;
   procCount.textContent = `プロセス数: ${arr.length}`;
-  procBody.innerHTML=''; const frag=document.createDocumentFragment();
-  for (const p of arr){
-    const stopped = ((p.state||'').toUpperCase().indexOf('T')!==-1);
-    const tr=document.createElement('tr'); tr.className='hover:bg-slate-800/50';
-    tr.innerHTML=`
-      <td class="p-2 mono">${p.pid}</td>
-      <td class="p-2 truncate" title="${escapeHtml(p.command||'')}">${escapeHtml(p.title||'')}</td>
-      <td class="p-2">${escapeHtml(p.user||'')}</td>
-      <td class="p-2 mono">${p.cpu_percent==null?'--':p.cpu_percent.toFixed(1)}</td>
-      <td class="p-2 mono">${p.mem_percent==null?'--':p.mem_percent.toFixed(1)}</td>
-      <td class="p-2 mono">${fmtMiB(p.rss_kb)}</td>
-      <td class="p-2 mono">${escapeHtml(p.state||'')}</td>
-      <td class="p-2 mono">${p.nice==null?'':p.nice}</td>
-      <td class="p-2 mono">${p.priority==null?'':p.priority}</td>
-      <td class="p-2 mono">${escapeHtml(p.elapsed||'')}</td>
-      <td class="p-2">
-        <div class="flex gap-2">
-          ${(!IS_WINDOWS)? (stopped
-            ? `<button data-act="CONT" data-pid="${p.pid}" class="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs">再開</button>`
-            : `<button data-act="STOP" data-pid="${p.pid}" class="px-2 py-1 rounded bg-amber-600 hover:bg-amber-500 text-xs">停止</button>`
-          ) : ''}
-          <button data-act="TERM" data-pid="${p.pid}" class="px-2 py-1 rounded bg-sky-600 hover:bg-sky-500 text-xs">終了</button>
-          <button data-act="KILL" data-pid="${p.pid}" class="px-2 py-1 rounded bg-rose-600 hover:bg-rose-500 text-xs">強制終了</button>
-        </div>
-      </td>`;
+
+  procBody.innerHTML = '';
+  const frag = document.createDocumentFragment();
+
+  for (const p of arr) {
+    const stopped = ((p.state || '').toUpperCase().indexOf('T') !== -1);
+    const tr = document.createElement('tr');
+    tr.className = 'hover:bg-slate-800/50';
+    tr.innerHTML =
+      ` <td class="p-2 mono">${p.pid}</td>` +
+      ` <td class="p-2 truncate" title="${escapeHtml(p.command || '')}">${escapeHtml(p.title || '')}</td>` +
+      ` <td class="p-2">${escapeHtml(p.user || '')}</td>` +
+      ` <td class="p-2 mono">${p.cpu_percent == null ? '--' : p.cpu_percent.toFixed(1)}</td>` +
+      ` <td class="p-2 mono">${p.mem_percent == null ? '--' : p.mem_percent.toFixed(1)}</td>` +
+      ` <td class="p-2 mono">${fmtMiB(p.rss_kb)}</td>` +
+      ` <td class="p-2 mono">${escapeHtml(p.state || '')}</td>` +
+      ` <td class="p-2 mono">${p.nice == null ? '' : p.nice}</td>` +
+      ` <td class="p-2 mono">${p.priority == null ? '' : p.priority}</td>` +
+      ` <td class="p-2 mono">${escapeHtml(p.elapsed || '')}</td>` +
+      ` <td class="p-2"> ` +
+      ` <div class="flex gap-2"> ` +
+      `${(!IS_WINDOWS) ? (stopped ? `<button data-act="CONT" data-pid="${p.pid}" class="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs">再開</button>` : `<button data-act="STOP" data-pid="${p.pid}" class="px-2 py-1 rounded bg-amber-600 hover:bg-amber-500 text-xs">停止</button>`) : ''}` +
+      ` <button data-act="TERM" data-pid="${p.pid}" class="px-2 py-1 rounded bg-sky-600 hover:bg-sky-500 text-xs">終了</button>` +
+      ` <button data-act="KILL" data-pid="${p.pid}" class="px-2 py-1 rounded bg-rose-600 hover:bg-rose-500 text-xs">強制終了</button>` +
+      ` </div> </td>`;
+
     frag.appendChild(tr);
   }
+
   procBody.appendChild(frag);
 }
-document.querySelectorAll('thead th[data-key]').forEach(th=>{
-  th.addEventListener('click', ()=>{
-    const k=th.getAttribute('data-key');
-    if(state.sortKey===k){ state.sortDir = (state.sortDir==='asc')?'desc':'asc'; } else { state.sortKey=k; state.sortDir='asc'; }
+
+document.querySelectorAll('thead th[data-key]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.getAttribute('data-key');
+    if (state.sortKey === k) {
+      state.sortDir = (state.sortDir === 'asc') ? 'desc' : 'asc';
+    } else {
+      state.sortKey = k;
+      state.sortDir = 'asc';
+    }
     renderProcesses();
   });
 });
-procBody.addEventListener('click', async (e)=>{
-  const btn=e.target.closest('button[data-act]'); if(!btn) return;
-  const pid=btn.getAttribute('data-pid'); const act=btn.getAttribute('data-act');
-  try{
-    const res=await fetch(`?action=signal&pid=${encodeURIComponent(pid)}&sig=${encodeURIComponent(act)}`, {method:'POST'});
-    const j=await res.json(); btn.title = j.ok ? 'OK' : ('Error: '+(j.error||'')); setTimeout(()=>{ if(!state.inFlight) tick(); }, 250);
-  }catch{}
+
+procBody.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const pid = btn.getAttribute('data-pid');
+  const act = btn.getAttribute('data-act');
+  try {
+    const res = await fetch(`?action=signal&pid=${encodeURIComponent(pid)}&sig=${encodeURIComponent(act)}`, { method: 'POST' });
+    const j = await res.json();
+    btn.title = j.ok ? 'OK' : ('Error: ' + (j.error || ''));
+    setTimeout(() => {
+      if (!state.inFlight) tick();
+    }, 250);
+  } catch { }
 });
 
 const fm = {
-  init(){
+  init() {
     state.fmInit = true;
     const root = document.getElementById('fm-root').value;
-    document.getElementById('fm-linkto').value = root.replace(/\/?$/,'/') + 'example.atkfm-link';
+    document.getElementById('fm-linkto').value = root.replace(/\/?$/, '/') + 'example.atkfm-link';
     this.list();
     setFMHeight();
   },
-  info(msg, type){
+
+  info(msg, type) {
     const el = document.getElementById('fmInfo');
     if (!el) return;
-
     el.textContent = String(msg ?? '');
-
     const base = 'ml-3 text-base font-medium tracking-wide ';
-    const color =
-      type === 'error' ? 'text-rose-300' :
-      type === 'ok'    ? 'text-emerald-300' :
-                         'text-slate-100';
+    const color = type === 'error' ? 'text-rose-300' : type === 'ok' ? 'text-emerald-300' : 'text-slate-100';
     el.className = base + color;
   },
 
-  debug(msg){ document.getElementById('fmDebug').textContent = msg||''; },
+  debug(msg) {
+    document.getElementById('fmDebug').textContent = msg || '';
+  },
 
-  async list(){
+  async list() {
     const root = document.getElementById('fm-root').value;
-    if (root.slice(-1)!=='/' && !/\.(zip|7z)$/i.test(root)) {
+    if (root.slice(-1) !== '/' && !/\.(zip|7z)$/i.test(root)) {
       document.getElementById('fm-root').value = root + '/';
     }
-    try{
+    try {
       const url = `?ajax-typeof=get-directory&ajax-option=${encodeURIComponent(document.getElementById('fm-root').value)}`;
-      const res = await fetch(url, {cache:'no-store'});
+      const res = await fetch(url, { cache: 'no-store' });
       const data = await res.json();
       this.renderList(data);
-    } catch(e){
+    } catch (e) {
       this.info('エラー: データを更新できませんでした。', 'error');
     }
   },
-  renderList(e) {
 
+  renderList(e) {
     // ここは無理やり詰め込んだのであとで綺麗にしたい
-    const box = document.getElementById('fm-list'); box.innerHTML='';
-    if (e['atk-fm-error']){ this.info(e['atk-fm-error'], 'error'); return; }
+    const box = document.getElementById('fm-list');
+    box.innerHTML = '';
+
+    if (e['atk-fm-error']) {
+      this.info(e['atk-fm-error'], 'error');
+      return;
+    }
 
     const entries = Object.entries(e);
-    if (entries.length===0){ this.info('(空ディレクトリです)'); return; }
+    if (entries.length === 0) {
+      this.info('(空ディレクトリです)');
+      return;
+    }
 
     const frag = document.createDocumentFragment();
-    for (const [path, type] of entries){
+
+    for (const [path, type] of entries) {
       const base = path.split('/').pop();
       const div = document.createElement('div');
-      div.className='py-1 flex items-center gap-2';
+      div.className = 'py-1 flex items-center gap-2';
 
-      if (type==='a'){ // regular file
-        div.innerHTML = `<span>📄 ${escapeHtml(base)}</span>
-          <a class="atkfm-underline" href="?ajax-typeof=get-item&ajax-option=${encodeURIComponent(path)}" target="_blank" rel="noopener noreferrer"><span class="atkfm-btn">開く</span></a>
-          <button class="atkfm-btn" data-act="modal" data-path="${escapeHtml(path)}">操作</button>`;
-      } else if (type==='b'){ // directory
-        div.innerHTML = `<span>📁 ${escapeHtml(base)} (フォルダー)</span>
-          <button class="atkfm-btn atkfm-btn--accent" data-act="cd" data-path="${escapeHtml(path)}">開く</button>
-          <button class="atkfm-btn atkfm-btn--danger" data-act="rmdir" data-path="${escapeHtml(path)}">削除</button>
-          <button class="atkfm-btn" data-act="zip" data-path="${escapeHtml(path)}">圧縮</button>
-          <button class="atkfm-btn" data-act="rename" data-path="${escapeHtml(path)}">リネーム</button>
-          <button class="atkfm-btn" data-act="copyd" data-path="${escapeHtml(path)}">コピー</button>
-          <button class="atkfm-btn" data-act="count" data-path="${escapeHtml(path)}">詳細</button>`;
-      } else if (type==='c'){ // archive
-        div.innerHTML = `<span>🗜️ ${escapeHtml(base)} (zip他)</span>
-          <button class="atkfm-btn atkfm-btn--accent" data-act="cd" data-path="${escapeHtml(path)}">プレビュー</button>
-          <button class="atkfm-btn" data-act="unzip" data-path="${escapeHtml(path)}">展開</button>
-          <button class="atkfm-btn" data-act="modal" data-path="${escapeHtml(path)}">操作</button>`;
-      } else if (type==='d'){ // inside zip
-        div.innerHTML = `<span>📦 ${escapeHtml(base)} (zip内)</span>
-          <a class="atkfm-underline" href="?ajax-typeof=get-item-zip&ajax-option=${encodeURIComponent(document.getElementById('fm-root').value)}&ajax-option2=${encodeURIComponent(path)}" target="_blank" rel="noopener noreferrer"><span class="atkfm-btn">表示</span></a>
-          <button class="atkfm-btn atkfm-btn--danger" data-act="rmzip" data-path="${escapeHtml(path)}">削除</button>`;
-      } else if (type==='e'){ // link
-        div.innerHTML = `<span>🔗 ${escapeHtml(base)} (リンク)</span>
-          <button class="atkfm-btn atkfm-btn--accent" data-act="link-move" data-path="${escapeHtml(path)}">移動</button>
-          <button class="atkfm-btn" data-act="link-show" data-path="${escapeHtml(path)}">リンク先表示</button>
-          <button class="atkfm-btn" data-act="rename" data-path="${escapeHtml(path)}">リネーム</button>
-          <button class="atkfm-btn atkfm-btn--danger" data-act="rm" data-path="${escapeHtml(path)}">削除</button>`;
-      } else if (type==='f'){ // encrypted
-        div.innerHTML = `<span>🔒 ${escapeHtml(base)} (暗号ファイル)</span>
-          <button class="atkfm-btn" data-act="decrypt" data-path="${escapeHtml(path)}">復号化</button>
-          <a class="atkfm-underline" href="?ajax-typeof=download-item&ajax-option=${encodeURIComponent(path)}" target="_blank" rel="noopener noreferrer"><span class="atkfm-btn">ダウンロード</span></a>
-          <button class="atkfm-btn" data-act="modal" data-path="${escapeHtml(path)}">操作</button>`;
+      if (type === 'a') { // regular file
+        div.innerHTML =
+          `<span>📄 ${escapeHtml(base)}</span> ` +
+          `<a class="atkfm-underline" href="?ajax-typeof=get-item&ajax-option=${encodeURIComponent(path)}" target="_blank" rel="noopener noreferrer"><span class="atkfm-btn">開く</span></a> ` +
+          `<button class="atkfm-btn" data-act="modal" data-path="${escapeHtml(path)}">操作</button>`;
+      } else if (type === 'b') { // directory
+        div.innerHTML =
+          `<span>📁 ${escapeHtml(base)} (フォルダー)</span> ` +
+          `<button class="atkfm-btn atkfm-btn--accent" data-act="cd" data-path="${escapeHtml(path)}">開く</button> ` +
+          `<button class="atkfm-btn atkfm-btn--danger" data-act="rmdir" data-path="${escapeHtml(path)}">削除</button> ` +
+          `<button class="atkfm-btn" data-act="zip" data-path="${escapeHtml(path)}">圧縮</button> ` +
+          `<button class="atkfm-btn" data-act="rename" data-path="${escapeHtml(path)}">リネーム</button> ` +
+          `<button class="atkfm-btn" data-act="copyd" data-path="${escapeHtml(path)}">コピー</button> ` +
+          `<button class="atkfm-btn" data-act="count" data-path="${escapeHtml(path)}">詳細</button>`;
+      } else if (type === 'c') { // archive
+        div.innerHTML =
+          `<span>🗜️ ${escapeHtml(base)} (zip他)</span> ` +
+          `<button class="atkfm-btn atkfm-btn--accent" data-act="cd" data-path="${escapeHtml(path)}">プレビュー</button> ` +
+          `<button class="atkfm-btn" data-act="unzip" data-path="${escapeHtml(path)}">展開</button> ` +
+          `<button class="atkfm-btn" data-act="modal" data-path="${escapeHtml(path)}">操作</button>`;
+      } else if (type === 'd') { // inside zip
+        div.innerHTML =
+          `<span>📦 ${escapeHtml(base)} (zip内)</span> ` +
+          `<a class="atkfm-underline" href="?ajax-typeof=get-item-zip&ajax-option=${encodeURIComponent(document.getElementById('fm-root').value)}&ajax-option2=${encodeURIComponent(path)}" target="_blank" rel="noopener noreferrer"><span class="atkfm-btn">表示</span></a> ` +
+          `<button class="atkfm-btn atkfm-btn--danger" data-act="rmzip" data-path="${escapeHtml(path)}">削除</button>`;
+      } else if (type === 'e') { // link
+        div.innerHTML =
+          `<span>🔗 ${escapeHtml(base)} (リンク)</span> ` +
+          `<button class="atkfm-btn atkfm-btn--accent" data-act="link-move" data-path="${escapeHtml(path)}">移動</button> ` +
+          `<button class="atkfm-btn" data-act="link-show" data-path="${escapeHtml(path)}">リンク先表示</button> ` +
+          `<button class="atkfm-btn" data-act="rename" data-path="${escapeHtml(path)}">リネーム</button> ` +
+          `<button class="atkfm-btn atkfm-btn--danger" data-act="rm" data-path="${escapeHtml(path)}">削除</button>`;
+      } else if (type === 'f') { // encrypted
+        div.innerHTML =
+          `<span>🔒 ${escapeHtml(base)} (暗号ファイル)</span> ` +
+          `<button class="atkfm-btn" data-act="decrypt" data-path="${escapeHtml(path)}">復号化</button> ` +
+          `<a class="atkfm-underline" href="?ajax-typeof=download-item&ajax-option=${encodeURIComponent(path)}" target="_blank" rel="noopener noreferrer"><span class="atkfm-btn">ダウンロード</span></a> ` +
+          `<button class="atkfm-btn" data-act="modal" data-path="${escapeHtml(path)}">操作</button>`;
       } else {
         div.textContent = `(未対応) ${path}`;
       }
 
       frag.appendChild(div);
     }
+
     box.appendChild(frag);
   },
-  async up(){
-    const root = document.getElementById('fm-root').value.replace(/\/$/,'');
+
+  async up() {
+    const root = document.getElementById('fm-root').value.replace(/\/$/, '');
     const up = root.substring(0, root.lastIndexOf('/')) || '/';
     document.getElementById('fm-root').value = up.endsWith('/') ? up : up + '/';
     this.list();
   },
-  async count(path){
+
+  async count(path) {
     const p = path || document.getElementById('fm-root').value;
-    try{
-      const res=await fetch(`?ajax-typeof=count-directory-files&ajax-option=${encodeURIComponent(p)}`);
-      const j=await res.json();
+    try {
+      const res = await fetch(`?ajax-typeof=count-directory-files&ajax-option=${encodeURIComponent(p)}`);
+      const j = await res.json();
       this.info(`${j.File}個のファイル、${j.Directory}個のディレクトリ。計測時間:${j.Time.toFixed(3)}秒、サイズ:${j.SIZE}`);
-    }catch{ this.info('エラー: 詳細取得に失敗'); }
+    } catch {
+      this.info('エラー: 詳細取得に失敗');
+    }
   },
-  viewList(){ const p=document.getElementById('fm-root').value; window.open(`?ajax-typeof=list-view&ajax-option=${encodeURIComponent(p)}`,'_blank'); },
-  async addFile(){
-    const name=document.getElementById('fm-add-file').value.trim(); if(!name){ this.info('ファイル名が空'); return; }
-    const res=await fetch(`?ajax-typeof=add-item&ajax-option=${encodeURIComponent(name)}`); await res.text(); this.info('ファイルを新規作成しました。'); this.list();
+
+  viewList() {
+    const p = document.getElementById('fm-root').value;
+    window.open(`?ajax-typeof=list-view&ajax-option=${encodeURIComponent(p)}`, '_blank');
   },
-  async addDir(){
-    const name=document.getElementById('fm-add-dir').value.trim(); if(!name){ this.info('ディレクトリ名が空'); return; }
-    await fetch(`?ajax-typeof=add-directory&ajax-option=${encodeURIComponent(name)}`); this.info('ディレクトリを新規作成しました。'); this.list();
+
+  async addFile() {
+    const name = document.getElementById('fm-add-file').value.trim();
+    if (!name) {
+      this.info('ファイル名が空');
+      return;
+    }
+    const res = await fetch(`?ajax-typeof=add-item&ajax-option=${encodeURIComponent(name)}`);
+    await res.text();
+    this.info('ファイルを新規作成しました。');
+    this.list();
   },
-  async upload(){
-    const files=document.getElementById('fm-upload-files').files; if(!files.length){ this.info('ファイル未選択'); return; }
-    const body=new FormData(); for(const f of files){ body.append('file[]', f); }
+
+  async addDir() {
+    const name = document.getElementById('fm-add-dir').value.trim();
+    if (!name) {
+      this.info('ディレクトリ名が空');
+      return;
+    }
+    await fetch(`?ajax-typeof=add-directory&ajax-option=${encodeURIComponent(name)}`);
+    this.info('ディレクトリを新規作成しました。');
+    this.list();
+  },
+
+  async upload() {
+    const files = document.getElementById('fm-upload-files').files;
+    if (!files.length) {
+      this.info('ファイル未選択');
+      return;
+    }
+    const body = new FormData();
+    for (const f of files) {
+      body.append('file[]', f);
+    }
     this.info('アップロードしています…');
-    const res = await fetch(`?ajax-typeof=upload-item`, {method:'POST', body}); const t=await res.text(); this.info(t); this.list();
+    const res = await fetch(`?ajax-typeof=upload-item`, { method: 'POST', body });
+    const t = await res.text();
+    this.info(t);
+    this.list();
   },
-  async chunkUpload(){
-    const f=document.getElementById('fm-chunk-file').files[0]; if(!f){ this.info('ファイル未選択'); return; }
-    const sizeMB = parseInt(document.getElementById('fm-chunk-mb').value||'3',10);
+
+  async chunkUpload() {
+    const f = document.getElementById('fm-chunk-file').files[0];
+    if (!f) {
+      this.info('ファイル未選択');
+      return;
+    }
+    const sizeMB = parseInt(document.getElementById('fm-chunk-mb').value || '3', 10);
     const chunk = Math.max(1, sizeMB) * 1024 * 1024;
     const totalParts = Math.ceil(f.size / chunk);
-    for (let i=0;i<totalParts;i++){
-      const body=new FormData();
-      body.append('data', f.slice(i*chunk, (i+1)*chunk));
+    for (let i = 0; i < totalParts; i++) {
+      const body = new FormData();
+      body.append('data', f.slice(i * chunk, (i + 1) * chunk));
       body.append('filename', f.name);
       try {
-        const res=await fetch(`?ajax-typeof=min-upload-item`, {method:'POST', body, cache:'no-cache'});
+        const res = await fetch(`?ajax-typeof=min-upload-item`, { method: 'POST', body, cache: 'no-cache' });
         await res.json();
-        this.debug(`Upload %: ${Math.ceil(100*(i+1)/totalParts)}\nUploaded/Total: ${i+1}/${totalParts}`);
-        this.info(`ファイルを分割アップロードしています…(${Math.ceil(100*(i+1)/totalParts)}%完了)`);
+        this.debug(`Upload %: ${Math.ceil(100 * (i + 1) / totalParts)}\nUploaded/Total: ${i + 1}/${totalParts}`);
+        this.info(`ファイルを分割アップロードしています…(${Math.ceil(100 * (i + 1) / totalParts)}%完了)`);
       } catch (e) {
-        this.info('エラー: 分割アップロードに失敗'); return;
+        this.info('エラー: 分割アップロードに失敗');
+        return;
       }
-      await new Promise(r=>setTimeout(r,10));
+      await new Promise(r => setTimeout(r, 10));
     }
-    const endBody=new FormData(); endBody.append('FileName', f.name);
-    try{ await fetch(`?ajax-typeof=min-upload-item&ajax-option=remove-upload-info`, {method:'POST', body:endBody}); }catch{}
-    this.info('ファイルを分割アップロードしました！'); document.getElementById('fm-chunk-file').value=''; this.list();
+    const endBody = new FormData();
+    endBody.append('FileName', f.name);
+    try {
+      await fetch(`?ajax-typeof=min-upload-item&ajax-option=remove-upload-info`, { method: 'POST', body: endBody });
+    } catch { }
+    this.info('ファイルを分割アップロードしました！');
+    document.getElementById('fm-chunk-file').value = '';
+    this.list();
   },
-  async uploadFromUrl(){
-    const u=document.getElementById('fm-url').value.trim(); if(!u){ this.info('URL未入力'); return; }
-    const res=await fetch(`?ajax-typeof=uploadfromurl&ajax-option=${encodeURIComponent(u)}`); const t=await res.text(); this.info(t); this.list();
+
+  async uploadFromUrl() {
+    const u = document.getElementById('fm-url').value.trim();
+    if (!u) {
+      this.info('URL未入力');
+      return;
+    }
+    const res = await fetch(`?ajax-typeof=uploadfromurl&ajax-option=${encodeURIComponent(u)}`);
+    const t = await res.text();
+    this.info(t);
+    this.list();
   },
-  async makeLink(){
-    const link=document.getElementById('fm-linkto').value.trim(); if(!link){ this.info('リンク先未指定'); return; }
-    const res=await fetch(`?ajax-typeof=create-link&ajax-option=${encodeURIComponent(link)}`); await res.text(); this.info('リンクを作成しました。'); this.list();
+
+  async makeLink() {
+    const link = document.getElementById('fm-linkto').value.trim();
+    if (!link) {
+      this.info('リンク先未指定');
+      return;
+    }
+    const res = await fetch(`?ajax-typeof=create-link&ajax-option=${encodeURIComponent(link)}`);
+    await res.text();
+    this.info('リンクを作成しました。');
+    this.list();
   },
-  async handleListClick(e){
-    const btn=e.target.closest('button'); if(!btn) return;
-    const act=btn.getAttribute('data-act'); const path=btn.getAttribute('data-path');
-    if (act==='cd'){ document.getElementById('fm-root').value = path.endsWith('/')? path : (/\.(zip|7z)$/i.test(path)?path:path+'/'); this.list(); }
-    else if (act==='rmdir'){ if(!confirm('ディレクトリを削除しますか？')) return; await fetch(`?ajax-typeof=remove-directory&ajax-option=${encodeURIComponent(path)}`); this.info('ディレクトリを削除しました。'); this.list(); }
-    else if (act==='zip'){ await fetch(`?ajax-typeof=make-zip&ajax-option=${encodeURIComponent(path)}`); this.info('フォルダーを圧縮しました。'); this.list(); }
-    else if (act==='rename'){ const n=prompt('パスを入力してください', path); if(!n) return; await fetch(`?ajax-typeof=rename-item&ajax-option=${encodeURIComponent(path)}&ajax-option2=${encodeURIComponent(n)}`); this.info('ファイル名を変更しました。'); this.list(); }
-    else if (act==='copyd'){ await fetch(`?ajax-typeof=copy-item&ajax-option=${encodeURIComponent(path)}`); this.info('ディレクトリをコピーしました。'); this.list(); }
-    else if (act==='count'){ this.count(path); }
-    else if (act==='unzip'){ const res=await fetch(`?ajax-typeof=open-zip&ajax-option=${encodeURIComponent(path)}`); this.info(await res.text()); this.list(); }
-    else if (act==='rmzip'){ if(!confirm('削除しますか？')) return; const base=document.getElementById('fm-root').value; await fetch(`?ajax-typeof=remove-item-zip&ajax-option=${encodeURIComponent(base)}&ajax-option2=${encodeURIComponent(path)}`); this.info('削除しました。'); this.list(); }
-    else if (act==='link-move'){ const res=await fetch(`?ajax-typeof=get-linkto&ajax-option=${encodeURIComponent(path)}`); const t=await res.text(); if(t){ document.getElementById('fm-root').value = decodeURIComponent(t); this.list(); } }
-    else if (act==='link-show'){ const res=await fetch(`?ajax-typeof=get-linkto&ajax-option=${encodeURIComponent(path)}`); this.info('リンク先: '+decodeURIComponent(await res.text())); }
-    else if (act==='decrypt'){ const pw=prompt('【ファイル複合化】パスワードを入力してください。'); if(!pw) { this.info('キャンセル'); return; } const res=await fetch(`?ajax-typeof=decrypt-item&ajax-option=${encodeURIComponent(path)}&ajax-option2=${encodeURIComponent(pw)}`); this.info(await res.text()); this.list(); }
-    else if (act==='modal'){ this.openModal(path); }
-    else if (act==='rm'){ if(!confirm('ファイルを削除しますか？')) return; await fetch(`?ajax-typeof=remove-item&ajax-option=${encodeURIComponent(path)}`); this.info('削除しました。'); this.list(); }
+
+  async handleListClick(e) {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    const act = btn.getAttribute('data-act');
+    const path = btn.getAttribute('data-path');
+
+    if (act === 'cd') {
+      document.getElementById('fm-root').value = path.endsWith('/') ? path : (/\.(zip|7z)$/i.test(path) ? path : path + '/');
+      this.list();
+    } else if (act === 'rmdir') {
+      if (!confirm('ディレクトリを削除しますか？')) return;
+      await fetch(`?ajax-typeof=remove-directory&ajax-option=${encodeURIComponent(path)}`);
+      this.info('ディレクトリを削除しました。');
+      this.list();
+    } else if (act === 'zip') {
+      await fetch(`?ajax-typeof=make-zip&ajax-option=${encodeURIComponent(path)}`);
+      this.info('フォルダーを圧縮しました。');
+      this.list();
+    } else if (act === 'rename') {
+      const n = prompt('パスを入力してください', path);
+      if (!n) return;
+      await fetch(`?ajax-typeof=rename-item&ajax-option=${encodeURIComponent(path)}&ajax-option2=${encodeURIComponent(n)}`);
+      this.info('ファイル名を変更しました。');
+      this.list();
+    } else if (act === 'copyd') {
+      await fetch(`?ajax-typeof=copy-item&ajax-option=${encodeURIComponent(path)}`);
+      this.info('ディレクトリをコピーしました。');
+      this.list();
+    } else if (act === 'count') {
+      this.count(path);
+    } else if (act === 'unzip') {
+      const res = await fetch(`?ajax-typeof=open-zip&ajax-option=${encodeURIComponent(path)}`);
+      this.info(await res.text());
+      this.list();
+    } else if (act === 'rmzip') {
+      if (!confirm('削除しますか？')) return;
+      const base = document.getElementById('fm-root').value;
+      await fetch(`?ajax-typeof=remove-item-zip&ajax-option=${encodeURIComponent(base)}&ajax-option2=${encodeURIComponent(path)}`);
+      this.info('削除しました。');
+      this.list();
+    } else if (act === 'link-move') {
+      const res = await fetch(`?ajax-typeof=get-linkto&ajax-option=${encodeURIComponent(path)}`);
+      const t = await res.text();
+      if (t) {
+        document.getElementById('fm-root').value = decodeURIComponent(t);
+        this.list();
+      }
+    } else if (act === 'link-show') {
+      const res = await fetch(`?ajax-typeof=get-linkto&ajax-option=${encodeURIComponent(path)}`);
+      this.info('リンク先: ' + decodeURIComponent(await res.text()));
+    } else if (act === 'decrypt') {
+      const pw = prompt('【ファイル複合化】パスワードを入力してください。');
+      if (!pw) { this.info('キャンセル'); return; }
+      const res = await fetch(`?ajax-typeof=decrypt-item&ajax-option=${encodeURIComponent(path)}&ajax-option2=${encodeURIComponent(pw)}`);
+      this.info(await res.text());
+      this.list();
+    } else if (act === 'modal') {
+      this.openModal(path);
+    } else if (act === 'rm') {
+      if (!confirm('ファイルを削除しますか？')) return;
+      await fetch(`?ajax-typeof=remove-item&ajax-option=${encodeURIComponent(path)}`);
+      this.info('削除しました。');
+      this.list();
+    }
   },
-openModal(path){
-  document.getElementById('fm-selected').value = path;
-  const box = document.getElementById('fm-actions');
-  const encPath = encodeURIComponent(path);
 
-  const linkBtn = (label, href, extra='') =>
-    `<a class="atkfm-underline atkfm-btn w-full ${extra}" href="${href}" target="_blank" rel="noopener noreferrer" onclick="fm.closeModal()">${label}</a>`;
-  const actBtn = (label, handler, extra='') =>
-    `<button class="atkfm-btn w-full ${extra}" onclick="fm.closeModal(); ${handler}">${label}</button>`;
+  openModal(path) {
+    document.getElementById('fm-selected').value = path;
+    const box = document.getElementById('fm-actions');
+    const encPath = encodeURIComponent(path);
 
-  box.innerHTML = [
-    linkBtn('開く', `?ajax-typeof=get-item&ajax-option=${encPath}`, 'atkfm-btn--accent'),
-    actBtn('削除', `fm.deleteSel();`, 'atkfm-btn--danger'),
+    const linkBtn = (label, href, extra = '') => `<a class="atkfm-underline atkfm-btn w-full ${extra}" href="${href}" target="_blank" rel="noopener noreferrer" onclick="fm.closeModal()">${label}</a>`;
+    const actBtn = (label, handler, extra = '') => `<button class="atkfm-btn w-full ${extra}" onclick="fm.closeModal(); ${handler}">${label}</button>`;
 
-    linkBtn('読み取り専用', `?ajax-typeof=get-item&readonly=true&ajax-option=${encPath}`),
-    linkBtn('HTML表示', `?ajax-typeof=view-html&ajax-option=${encPath}`),
-    linkBtn('バイナリ表示', `?ajax-typeof=view-hex&ajax-option=${encPath}`),
-    linkBtn('ダウンロード', `?ajax-typeof=download-item&ajax-option=${encPath}`),
+    box.innerHTML = [
+      linkBtn('開く', `?ajax-typeof=get-item&ajax-option=${encPath}`, 'atkfm-btn--accent'),
+      actBtn('削除', `fm.deleteSel();`, 'atkfm-btn--danger'),
+      linkBtn('読み取り専用', `?ajax-typeof=get-item&readonly=true&ajax-option=${encPath}`),
+      linkBtn('HTML表示', `?ajax-typeof=view-html&ajax-option=${encPath}`),
+      linkBtn('バイナリ表示', `?ajax-typeof=view-hex&ajax-option=${encPath}`),
+      linkBtn('ダウンロード', `?ajax-typeof=download-item&ajax-option=${encPath}`),
+      actBtn('リネーム', `fm.renameSel();`),
+      actBtn('コピー', `fm.copySel();`),
+      actBtn('ファイルサイズ取得', `fm.sizeSel();`),
+      actBtn('md5ハッシュ表示', `fm.md5Sel();`),
+      actBtn('暗号化', `fm.encryptSel();`)
+    ].map(x => `<div>${x}</div>`).join('');
 
-    actBtn('リネーム', `fm.renameSel();`),
-    actBtn('コピー', `fm.copySel();`),
-    actBtn('ファイルサイズ取得', `fm.sizeSel();`),
-    actBtn('md5ハッシュ表示', `fm.md5Sel();`),
+    const modal = document.getElementById('fm-modal');
+    modal.classList.remove('hidden');
+    document.getElementById('fm-modal-backdrop').onclick = () => this.closeModal();
 
-    actBtn('暗号化', `fm.encryptSel();`)
-  ].map(x=>`<div>${x}</div>`).join('');
+    document.addEventListener('keydown', escCloser);
+    function escCloser(e) {
+      if (e.key === 'Escape') {
+        fm.closeModal();
+        document.removeEventListener('keydown', escCloser);
+      }
+    }
+  },
 
-  const modal = document.getElementById('fm-modal');
-  modal.classList.remove('hidden');
-
-  document.getElementById('fm-modal-backdrop').onclick = ()=>this.closeModal();
-  document.addEventListener('keydown', escCloser);
-  function escCloser(e){ if(e.key==='Escape'){ fm.closeModal(); document.removeEventListener('keydown', escCloser); } }
-},
-
-  closeModal(){
+  closeModal() {
     document.getElementById('fm-modal').classList.add('hidden');
   },
 
-  async renameSel(){ const p=document.getElementById('fm-selected').value; const n=prompt('パスを入力してください', p); if(!n) return; await fetch(`?ajax-typeof=rename-item&ajax-option=${encodeURIComponent(p)}&ajax-option2=${encodeURIComponent(n)}`); this.closeModal(); this.info('リネームしました。'); this.list(); },
-  async copySel(){ const p=document.getElementById('fm-selected').value; await fetch(`?ajax-typeof=copy-item&ajax-option=${encodeURIComponent(p)}`); this.closeModal(); this.info('コピーしました。'); this.list(); },
-  async sizeSel(){
-  const p=document.getElementById('fm-selected').value;
-  fm.closeModal();
-  const res=await fetch(`?ajax-typeof=get-filesize&ajax-option=${encodeURIComponent(p)}`);
-  this.info('ファイルのサイズ: '+await res.text());
-},
-async md5Sel(){
-  const p=document.getElementById('fm-selected').value;
-  fm.closeModal();
-  const res=await fetch(`?ajax-typeof=get-filemd5&ajax-option=${encodeURIComponent(p)}`);
-  this.info('md5: '+await res.text());
-},
-  async encryptSel(){ const p=document.getElementById('fm-selected').value; const pw=prompt('【ファイル暗号化】パスワードを入力してください。'); if(!pw){ this.info('キャンセル'); return; } const res=await fetch(`?ajax-typeof=encrypt-item&ajax-option=${encodeURIComponent(p)}&ajax-option2=${encodeURIComponent(pw)}`); this.closeModal(); this.info(await res.text()); this.list(); },
-  async deleteSel(){ const p=document.getElementById('fm-selected').value; if(!confirm('削除しますか？')) return; await fetch(`?ajax-typeof=remove-item&ajax-option=${encodeURIComponent(p)}`); this.closeModal(); this.info('削除しました。'); this.list(); }
+  async renameSel() {
+    const p = document.getElementById('fm-selected').value;
+    const n = prompt('パスを入力してください', p);
+    if (!n) return;
+    await fetch(`?ajax-typeof=rename-item&ajax-option=${encodeURIComponent(p)}&ajax-option2=${encodeURIComponent(n)}`);
+    this.closeModal();
+    this.info('リネームしました。');
+    this.list();
+  },
+
+  async copySel() {
+    const p = document.getElementById('fm-selected').value;
+    await fetch(`?ajax-typeof=copy-item&ajax-option=${encodeURIComponent(p)}`);
+    this.closeModal();
+    this.info('コピーしました。');
+    this.list();
+  },
+
+  async sizeSel() {
+    const p = document.getElementById('fm-selected').value;
+    fm.closeModal();
+    const res = await fetch(`?ajax-typeof=get-filesize&ajax-option=${encodeURIComponent(p)}`);
+    this.info('ファイルのサイズ: ' + await res.text());
+  },
+
+  async md5Sel() {
+    const p = document.getElementById('fm-selected').value;
+    fm.closeModal();
+    const res = await fetch(`?ajax-typeof=get-filemd5&ajax-option=${encodeURIComponent(p)}`);
+    this.info('md5: ' + await res.text());
+  },
+
+  async encryptSel() {
+    const p = document.getElementById('fm-selected').value;
+    const pw = prompt('【ファイル暗号化】パスワードを入力してください。');
+    if (!pw) { this.info('キャンセル'); return; }
+    const res = await fetch(`?ajax-typeof=encrypt-item&ajax-option=${encodeURIComponent(p)}&ajax-option2=${encodeURIComponent(pw)}`);
+    this.closeModal();
+    this.info(await res.text());
+    this.list();
+  },
+
+  async deleteSel() {
+    const p = document.getElementById('fm-selected').value;
+    if (!confirm('削除しますか？')) return;
+    await fetch(`?ajax-typeof=remove-item&ajax-option=${encodeURIComponent(p)}`);
+    this.closeModal();
+    this.info('削除しました。');
+    this.list();
+  }
 };
-document.getElementById('fm-list').addEventListener('click', (e)=>fm.handleListClick(e));
+
+document.getElementById('fm-list').addEventListener('click', (e) => fm.handleListClick(e));
 
 const cfg = {
   hasPassword: false,
   me: '',
 
-  async load(){
-    try{
-      const r = await fetch('?action=config-get', {cache:'no-store'});
+  async load() {
+    try {
+      const r = await fetch('?action=config-get', { cache: 'no-store' });
       const j = await r.json();
       if (!j.ok) throw new Error('config-get failed');
 
@@ -2758,28 +3672,21 @@ const cfg = {
     }
   },
 
-  async savePassword(clear=false){
+  async savePassword(clear = false) {
     const info = document.getElementById('cfg-pass-info');
     if (info) info.textContent = '保存中...';
 
     const npwEl = document.getElementById('cfg-pass-new');
     const npw = npwEl ? npwEl.value : '';
-
     if (!clear && npw.length === 0) {
       if (info) info.textContent = '新しいパスワードが空です。';
       return;
     }
 
-    const body = clear
-      ? { change:'password-clear' }
-      : { change:'password', newPassword: npw };
+    const body = clear ? { change: 'password-clear' } : { change: 'password', newPassword: npw };
 
-    try{
-      const r = await fetch('?action=config-set', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(body)
-      });
+    try {
+      const r = await fetch('?action=config-set', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const j = await r.json();
       if (j.ok) {
         if (info) info.textContent = clear ? 'パスワードを削除しました。' : 'パスワードを更新しました。';
@@ -2793,22 +3700,17 @@ const cfg = {
     }
   },
 
-  async saveIp(){
+  async saveIp() {
     const info = document.getElementById('cfg-ip-info');
     if (info) info.textContent = '保存中…';
     const ta = document.getElementById('cfg-ip-allow');
-    const list = ta ? ta.value.split(/\r?\n/).map(s=>s.trim()) : [];
-
-    try{
-      const r = await fetch('?action=config-set', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({change:'ip', ipAllow:list})
-      });
+    const list = ta ? ta.value.split(/\r?\n/).map(s => s.trim()) : [];
+    try {
+      const r = await fetch('?action=config-set', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ change: 'ip', ipAllow: list }) });
       const j = await r.json();
       if (j.ok) {
         if (info) info.textContent = 'IP許可リストを更新しました。';
-        if (ta) ta.value = (j.ipAllow||[]).join('\n');
+        if (ta) ta.value = (j.ipAllow || []).join('\n');
       } else {
         if (info) info.textContent = 'エラー: ' + (j.error || '失敗しました');
       }
@@ -2818,24 +3720,34 @@ const cfg = {
   },
 };
 
-document.getElementById('cfg-pass-save') .addEventListener('click', ()=>cfg.savePassword(false));
-document.getElementById('cfg-pass-clear').addEventListener('click', ()=>cfg.savePassword(true));
-document.getElementById('cfg-ip-save')   .addEventListener('click', ()=>cfg.saveIp());
-document.getElementById('cfg-ip-add-self').addEventListener('click', ()=>{
+document.getElementById('cfg-pass-save').addEventListener('click', () => cfg.savePassword(false));
+document.getElementById('cfg-pass-clear').addEventListener('click', () => cfg.savePassword(true));
+document.getElementById('cfg-ip-save').addEventListener('click', () => cfg.saveIp());
+
+document.getElementById('cfg-ip-add-self').addEventListener('click', () => {
   if (!cfg.me) return;
   const ta = document.getElementById('cfg-ip-allow');
   const lines = ta.value.split(/\r?\n/);
-  if (!lines.some(l=>l.trim()===cfg.me)) { lines.push(cfg.me); ta.value = lines.join('\n'); }
+  if (!lines.some(l => l.trim() === cfg.me)) {
+    lines.push(cfg.me);
+    ta.value = lines.join('\n');
+  }
 });
 
 renderStaticSpecs();
+
 suppressHash = true;
-setTab(tabFromHash());
+const firstTab = tabFromHash();
+if (firstTab === 'terminal') {
+  window.addEventListener('load', () => setTab('terminal'));
+} else {
+  setTab(firstTab);
+}
 suppressHash = false;
 
-function setFMHeight(){
+function setFMHeight() {
   const wrap = document.querySelector('#pageFiles .atkfm-wrap');
-  if(!wrap) return;
+  if (!wrap) return;
   const rect = wrap.getBoundingClientRect();
   const top = rect.top + window.scrollY;
   const inner = window.innerHeight;
@@ -2843,9 +3755,487 @@ function setFMHeight(){
   const h = Math.max(240, inner - rect.top - bottomPadding);
   wrap.style.height = h + 'px';
 }
+
 window.addEventListener('resize', setFMHeight);
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) setFMHeight(); });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) setFMHeight();
+});
+
+const term = {
+  _inited: false,
+  xterm: null,
+  fit: null,
+
+  mode: 'tmux',
+  tabs: [],
+  active: null,
+  pollTimer: null,
+  _polling: false,
+  lastScreenB64: '',
+  lastCx: null,
+  lastCy: null,
+
+  sendBuf: '',
+  sendTimer: null,
+
+  basicSid: null,
+  basicCwd: null,
+  lineBuf: '',
+  basicNoticeShown: false,
+
+  fontSize: parseInt(localStorage.getItem('atkfm_term_font') || '14', 10),
+
+  _log(...a){ if (window.ATKFM_DEBUG) console.debug('[term]', ...a); },
+  _err(m){ console.error(m); try{ this.xterm?.writeln('\r\n\x1b[31m[ERROR]\x1b[0m '+m);}catch{} },
+
+  _readCookie(name){
+    return decodeURIComponent((document.cookie.split('; ').find(s=>s.startsWith(name+'='))||'')
+      .split('=').slice(1).join('=')||'');
+  },
+  async _ensureCsrfReady(deadlineMs=2000){
+    const t0 = performance.now();
+    while (!this._readCookie('ATKFM_CSRF') && (performance.now()-t0) < deadlineMs){
+      await new Promise(r=>setTimeout(r, 25));
+    }
+  },
+  _csrf(){
+    if (this.__csrf) return this.__csrf;
+    const token = this._readCookie('ATKFM_CSRF') || '';
+    this.__csrf = { token, headerName: 'X-CSRF-Token' };
+    return this.__csrf;
+  },
+  _withCsrfHeaders(h = {}){
+    const {token, headerName} = this._csrf();
+    const headers = { 'X-Requested-With':'XMLHttpRequest', ...h };
+    if (token) headers[headerName] = token;
+    return headers;
+  },
+  async _fetchJSON(url, opts={}, timeoutMs=10000){
+    const ac = new AbortController();
+    const timer = setTimeout(()=>ac.abort(), timeoutMs);
+    const isPost = String((opts.method||'GET')).toUpperCase()==='POST';
+    if (isPost) await this._ensureCsrfReady();
+    try{
+      const r = await fetch(url, {
+        credentials:'same-origin',
+        cache:'no-store',
+        ...opts,
+        headers: this._withCsrfHeaders(opts.headers||{}),
+        signal: ac.signal
+      });
+      const ct = (r.headers.get('content-type')||'').toLowerCase();
+      if (!ct.includes('application/json')) throw new Error('bad content-type: '+ct);
+      let j = await r.json();
+
+      if (!j.ok && j.error === 'bad csrf token' && isPost && !opts._retried){
+        await this._ensureCsrfReady();
+        return await this._fetchJSON(url, {...opts, _retried:true}, timeoutMs);
+      }
+      return j;
+    } finally { clearTimeout(timer); }
+  },
+  async _fetchJSONForm(url, formData, timeoutMs=10000){
+    return await this._fetchJSON(url, {method:'POST', body: formData}, timeoutMs);
+  },
+
+  _renderCapture(out_b64, cy, cx, h, w){
+    const raw = atob(out_b64).replace(/\x0c/g, '');
+    const lines = raw.split('\n');
+
+    const height = Math.max(1, h|0);
+    const width  = Math.max(1, w|0);
+
+    let esc = '\x1b[H\x1b[2J';
+
+    for (let i = 0; i < height; i++){
+      const ln = lines[i] ?? '';
+      const clipped = ln.length > width ? ln.slice(0, width) : ln;
+      esc += `\x1b[${i+1};1H${clipped}\x1b[K`;
+    }
+
+    if (Number.isInteger(cy) && Number.isInteger(cx)){
+      esc += `\x1b[${(cy|0)+1};${(cx|0)+1}H`;
+      this.lastCy = cy|0;
+      this.lastCx = cx|0;
+    }
+
+    if (typeof this.xterm.writeSync === 'function') this.xterm.writeSync(esc);
+    else this.xterm.write(esc);
+  },
+
+  initOnce(){
+    if (this._inited) return;
+    this._inited = true;
+
+    this.xterm = new window.Terminal({
+      convertEol:false,
+      fontSize:this.fontSize,
+      fontFamily:'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+      cursorBlink:true,
+      cursorStyle:'block',
+      disableStdin:false,
+      scrollback:5000,
+      allowProposedApi:true
+    });
+    this.fit = new window.FitAddon.FitAddon();
+    this.xterm.loadAddon(this.fit);
+    this.xterm.open(document.getElementById('xterm'));
+    this.fit.fit();
+    this.xterm.focus();
+
+    this.xterm.onData((data)=>{ this.mode==='tmux' ? this._enqueueSend(data) : this._handleBasicInput(data); });
+
+    const fontSel = document.getElementById('term-font');
+    if (fontSel){
+      fontSel.value = String(this.fontSize);
+      fontSel.addEventListener('change', ()=>{
+        const px = parseInt(fontSel.value,10)||14;
+        this.fontSize = px;
+        localStorage.setItem('atkfm_term_font', String(px));
+        this.xterm.options.fontSize = px;
+        this._requestFit();
+      });
+    }
+
+    const wrapEl = document.getElementById('xterm-wrap');
+    let roQueued = false;
+    const onResize = ()=>{
+      if (roQueued) return;
+      roQueued = true;
+      requestAnimationFrame(()=>{
+        roQueued = false;
+        try{ this.fit.fit(); } finally { this._maybeResizePost(); }
+      });
+    };
+    new ResizeObserver(onResize).observe(wrapEl);
+    window.addEventListener('orientationchange', onResize);
+    document.addEventListener('visibilitychange', ()=>{ if (!document.hidden) onResize(); });
+
+    window.addEventListener('error', e=>this._err(String(e.error||e.message||'error')));
+    window.addEventListener('unhandledrejection', e=>this._err('Promise rejection: '+(e.reason?.message||e.reason||'unknown')));
+  },
+
+  bindUI(){
+    const newBtn = document.getElementById('term-newtab');
+    if (newBtn) newBtn.addEventListener('click', ()=>this.newTab());
+  },
+
+  async ensure(){
+    if (this.mode === 'tmux' && this.active) {
+      this._renderTabs();
+      this._startPollingTmux();
+      this._maybeResizePost();
+      return;
+    }
+    const ok = await this._tryOpenTmux();
+    if (!ok && !this.basicSid) await this._enterBasicMode(false);
+  },
+
+  _enqueueSend(data){
+    this.sendBuf += data;
+    if (!this.sendTimer) this.sendTimer = setTimeout(()=>this._flushSend(), 30);
+  },
+  async _flushSend(){
+    const chunk = this.sendBuf; this.sendBuf=''; clearTimeout(this.sendTimer); this.sendTimer=null;
+    if (!chunk || !this.active) return;
+    const j = await this._fetchJSON('?action=term2-write', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ sid:this.active, data_b64: btoa(chunk) })
+    }).catch(e=>this._err('write error: '+e.message));
+    if (j && !j.ok) this._err(j.error||'write failed');
+  },
+
+  async _tryOpenTmux(){
+    try{
+      const cols = this.xterm.cols || 120, rows = this.xterm.rows || 30;
+      const body = new FormData(); body.append('cols', String(cols)); body.append('rows', String(rows));
+      const j = await this._fetchJSONForm('?action=term2-open', body);
+      if (!j.ok) return false;
+
+      this.mode = 'tmux';
+      await this._refreshTmuxTabs();
+      this.active = j.sid;
+      this.lastScreenB64 = '';
+      this._showBannerOnceFor(j.sid);
+      this._renderTabs();
+      this._startPollingTmux();
+      this._maybeResizePost();
+      return true;
+    }catch(e){
+      this._log('open tmux failed', e); return false;
+    }
+  },
+
+  async _refreshTmuxTabs(){
+    const j = await this._fetchJSON('?action=term2-list', {method:'GET'}).catch(e=>this._err('list tabs: '+e.message));
+    if (j?.ok) this.tabs = j.tabs||[];
+    this._renderTabs();
+  },
+
+  _renderTabs(){
+    const box = document.getElementById('term-tabs'); if (!box) return;
+    box.innerHTML = '';
+    const frag = document.createDocumentFragment();
+
+    if (this.mode==='tmux'){
+      for (const t of this.tabs){
+        const wrap = document.createElement('div'); wrap.className='flex items-center gap-1';
+        const btn = document.createElement('button');
+        btn.className = 'atkfm-btn' + (t.id===this.active ? ' atkfm-btn--accent' : '');
+        btn.textContent = t.label; btn.title = t.label;
+        btn.addEventListener('click', ()=>this._switchTmuxTab(t.id));
+        const close = document.createElement('button');
+        close.className='atkfm-btn atkfm-btn--danger'; close.textContent='×'; close.title='閉じる';
+        close.addEventListener('click', (e)=>{ e.stopPropagation(); this._closeTmuxTab(t.id); });
+        wrap.append(btn, close);
+        frag.appendChild(wrap);
+      }
+    } else {
+      const wrap = document.createElement('div'); wrap.className='flex items-center gap-1';
+      const btn = document.createElement('button'); btn.className='atkfm-btn atkfm-btn--accent'; btn.textContent='basic';
+      const close = document.createElement('button'); close.className='atkfm-btn atkfm-btn--danger'; close.textContent='×';
+      close.addEventListener('click', ()=>this._enterBasicMode(true));
+      wrap.append(btn, close); frag.appendChild(wrap);
+    }
+    box.appendChild(frag);
+
+    const newBtn = document.getElementById('term-newtab');
+    if (newBtn){ newBtn.disabled = (this.mode!=='tmux'); newBtn.title = newBtn.disabled ? 'tmux をインストールすると有効になります' : '新しいタブ'; }
+  },
+
+  async _switchTmuxTab(id){
+    this.active = id; this.lastScreenB64='';
+    this._renderTabs();
+    this._startPollingTmux();
+    this._maybeResizePost();
+  },
+
+  async _closeTmuxTab(id){
+    try{
+      const fd = new FormData(); fd.append('sid', id);
+      await this._fetchJSONForm('?action=term2-close', fd);
+    }catch(e){ this._log('close tab failed', e); }
+    await this._refreshTmuxTabs();
+    if (this.tabs.length){
+      this.active = this.tabs[0].id; this.lastScreenB64='';
+      this._startPollingTmux(); this._maybeResizePost();
+    } else {
+      this.active = null; this._stopPollingTmux(); this.xterm.reset();
+    }
+  },
+
+  _stopPollingTmux(){ if (this.pollTimer){ clearTimeout(this.pollTimer); this.pollTimer=null; } this._polling=false; },
+
+  _startPollingTmux(){
+    this._stopPollingTmux();
+    const poll = async ()=>{
+      if (!this.active) return;
+      try{
+        const j = await this._fetchJSON(`?action=term2-read&sid=${encodeURIComponent(this.active)}&mode=screen`, {method:'GET'});
+        if (!j.ok){ this._err(j.error||'read failed'); return; }
+
+        const wantCols = (this.xterm?.cols|0) || 120;
+        const wantRows = (this.xterm?.rows|0) || 30;
+        if (((j.w|0) !== wantCols) || ((j.h|0) !== wantRows)) {
+          await this._maybeResizePost();
+        }
+
+        const screenChanged = (j.out_b64 !== this.lastScreenB64);
+        const cursorChanged = (
+          (typeof j.cx === 'number' && j.cx !== this.lastCx) ||
+          (typeof j.cy === 'number' && j.cy !== this.lastCy)
+        );
+
+        if (screenChanged){
+          this.lastScreenB64 = j.out_b64;
+          this._renderCapture(j.out_b64, j.cy, j.cx, j.h, j.w);
+        } else if (cursorChanged){
+          this._placeCursor(j.cy, j.cx);
+          this.lastCx = j.cx|0;
+          this.lastCy = j.cy|0;
+        }
+      }catch(e){
+        this._err('read error: '+e.message);
+      }
+    };
+    poll();
+    this.pollTimer = setInterval(poll, 500);
+  },
+
+  _placeCursor(row, col){
+    if (row==null || col==null) return;
+    const r = Math.max(1, (parseInt(row,10)|0) + 1);
+    const c = Math.max(1, (parseInt(col,10)|0) + 1);
+    this.xterm.write(`\x1b[${r};${c}H`);
+  },
+
+  _showBannerOnceFor(sid){
+    try{
+      if (!sid) return;
+      const key = 'atkfm_tmux_banner_'+sid;
+      if (sessionStorage.getItem(key)) return;
+      this.xterm.writeln('**********************************************************************');
+      this.xterm.writeln('** Terminal - WebTaskmgr / ATK-FM v2.0.1');
+      this.xterm.writeln('** (c) 2025 ActiveTK. All rights reserved.');
+      this.xterm.writeln('**********************************************************************\r\n');
+      sessionStorage.setItem(key, '1');
+    }catch{}
+  },
+
+  async _enterBasicMode(resetOutput=false){
+    this.mode='basic';
+    this._stopPollingTmux();
+    this.tabs=[]; this.active=null; this.lastScreenB64='';
+
+    if (!this.basicSid){
+      try{
+        const fd = new FormData(); fd.append('label','basic');
+        const j = await this._fetchJSONForm('?action=term-open', fd);
+        if (j.ok){ this.basicSid=j.sid; this.basicCwd=j.tab?.cwd||'/'; }
+        else { this.basicSid=null; this.basicCwd='/'; }
+      }catch{ this.basicSid=null; this.basicCwd='/'; }
+    }
+
+    if (resetOutput) this.xterm.reset();
+
+    if (!this.basicNoticeShown){
+      this.xterm.writeln('**********************************************************************');
+      this.xterm.writeln('** Terminal - WebTaskmgr / ATK-FM v2.0.1');
+      this.xterm.writeln('** (c) 2025 ActiveTK. All rights reserved.');
+      this.xterm.writeln('**********************************************************************');
+      this.xterm.writeln('** tmuxが見つかりません。以下のコマンドでtmuxを導入すると、より多くの機能を利用できます。');
+      this.xterm.writeln('** (apt) > sudo apt install -y tmux');
+      this.xterm.writeln('** (yum) > sudo yum install -y tmux');
+      this.xterm.writeln('**********************************************************************\r\n');
+      this.basicNoticeShown = true;
+    }
+
+    this._renderTabs();
+    this._writePrompt();
+  },
+
+  _promptString(){
+    let d = (this.basicCwd || '/').toString();
+    if (typeof IS_WINDOWS!=='undefined' && IS_WINDOWS){ if (!/[\\/]$/.test(d)) d += '\\'; }
+    else { if (!/\/$/.test(d)) d += '/'; }
+    const u = (typeof PROMPT_USER!=='undefined'?PROMPT_USER:'user');
+    const h = (typeof PROMPT_HOST!=='undefined'?PROMPT_HOST:'host');
+    return `[${u}@${h} ${d}]# `;
+  },
+  _writePrompt(){ this.xterm.write(this._promptString()); },
+
+  async _runBasic(cmd){
+    try{
+      const j = await this._fetchJSON('?action=term-run', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ sid:this.basicSid||'', input:cmd, cols:this.xterm.cols||120, rows:this.xterm.rows||30 })
+      });
+      if (j?.ok){
+        if (typeof j.out==='string' && j.out.length){
+          this.xterm.write(j.out.replace(/\n/g,'\r\n'));
+          if (!/\r?\n$/.test(j.out)) this.xterm.write('\r\n');
+        }
+        if (j.cwd) this.basicCwd = j.cwd;
+      } else {
+        this._err(j?.error||'command failed');
+      }
+    }catch(e){ this._err('network error: '+e.message); }
+    this._writePrompt();
+  },
+
+  async _handleBasicInput(data){
+    for (const ch of data){
+      const code = ch.charCodeAt(0);
+
+      if (ch === '\r' || ch === '\n'){
+        const cmd = this.lineBuf.trim();
+        this.xterm.write('\r\n');
+        this.lineBuf = '';
+        if (!cmd){ this._writePrompt(); continue; }
+        await this._runBasic(cmd);
+        continue;
+      }
+
+      if (code === 0x7f || code === 0x08){
+        if (this.lineBuf.length>0){ this.lineBuf = this.lineBuf.slice(0,-1); this.xterm.write('\b \b'); }
+        continue;
+      }
+
+      if (code === 0x03){ // Ctrl+C
+        this.xterm.write('^C\r\n');
+        try{
+          await this._fetchJSON('?action=term-interrupt', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ sid:this.basicSid||'' })
+          });
+        }catch{}
+        continue;
+      }
+
+      if (code < 32) continue;
+      this.lineBuf += ch;
+      this.xterm.write(ch);
+    }
+  },
+
+  lastCols: 0,
+  lastRows: 0,
+  _requestFit(){
+    try{ this.fit.fit(); } finally { this._maybeResizePost(); }
+  },
+  async _maybeResizePost(){
+    if (!this.xterm) return;
+    const cols = this.xterm.cols|0, rows = this.xterm.rows|0;
+    if (cols===this.lastCols && rows===this.lastRows) return;
+    this.lastCols = cols; this.lastRows = rows;
+
+    if (this.mode==='tmux' && this.active){
+      await this._fetchJSON('?action=term2-resize', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ sid:this.active, cols, rows })
+      }).catch(e=>this._log('resize failed', e));
+    }
+  },
+
+  async newTab(){
+    this.initOnce();
+    if (this.mode!=='tmux'){
+      this.xterm.writeln('\r\n[INFO] 複数タブは tmux が必要です。');
+      return;
+    }
+    try{
+      const body = new FormData();
+      body.append('cols', String(this.xterm.cols||120));
+      body.append('rows', String(this.xterm.rows||30));
+      const j = await this._fetchJSONForm('?action=term2-open', body);
+      if (j?.ok){
+        await this._refreshTmuxTabs();
+        this.active = j.sid;
+        this.lastScreenB64 = '';
+        this._showBannerOnceFor(j.sid);
+        this._renderTabs();
+        this._startPollingTmux();
+        this._maybeResizePost();
+      } else {
+        this._err(j?.error||'open failed');
+      }
+    }catch(e){ this._err('open error: '+e.message); }
+  }
+};
+
+window.term = term;
+window.addEventListener('DOMContentLoaded', () => {
+  try {
+    term.initOnce();
+    term.bindUI();
+  } catch (e) { console.error(e); }
+});
 
 </script>
+
 </body>
 </html>
