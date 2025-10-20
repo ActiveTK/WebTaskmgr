@@ -18,6 +18,7 @@ Web上でリソース管理からプロセス操作、ファイル編集まで�
 <img width="1289" height="704" alt="スクリーンショット 2025-09-12 135839" src="https://github.com/user-attachments/assets/ec8c1dcd-59c2-48ef-a19a-6f56f8b01b9d" />
 <img width="1290" height="901" alt="スクリーンショット 2025-09-12 135738" src="https://github.com/user-attachments/assets/7774c093-a17b-4c4f-a51a-786e9108c34c" />
 <img width="1508" height="846" alt="スクリーンショット 2025-09-12 135909" src="https://github.com/user-attachments/assets/7aff6073-29e0-4484-819a-ac9c05fdc316" />
+<img width="1323" height="827" alt="image" src="https://github.com/user-attachments/assets/47643fec-f02a-45c4-87b6-73530dc524bd" />
 
 ## 🕵️機能
 
@@ -57,7 +58,15 @@ Web上でリソース管理からプロセス操作、ファイル編集まで�
 
 ・AESによるファイル暗号化
 
-#### 4) 設定
+#### 4) ターミナル
+
+・tmuxによるフルカラーのターミナル制御
+
+・tmuxのない環境でも自動でフォールバックして対応
+
+・複数タブ機能
+
+#### 5) 設定
 
 ・パスワード設定/削除
 
