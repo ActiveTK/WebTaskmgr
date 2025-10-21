@@ -15,6 +15,7 @@
 $APP_CONFIG = [
   "PASSWORD_HASH" => null,
   "IP_ALLOW" => [],
+  "RUN_AS_ROOT" => false,
 ];
 // === APP_CONFIG_END ===
 
@@ -175,44 +176,57 @@ function cfg_write(array $new): array
   $self = __FILE__;
   $code = @file_get_contents($self);
   if ($code === false) {
-    return ["ok" => false, "error" => "read self failed"];
+    $code = app_run_as_root_enabled() ? root_fs_read($self) : false;
+    if ($code === false) {
+      return ["ok" => false, "error" => "read self failed"];
+    }
   }
 
   $startTag = "// === APP_CONFIG_START ===";
-  $endTag = "// === APP_CONFIG_END ===";
+  $endTag   = "// === APP_CONFIG_END ===";
   $start = strpos($code, $startTag);
-  $end = strpos($code, $endTag);
+  $end   = strpos($code, $endTag);
   if ($start === false || $end === false || $end <= $start) {
     return ["ok" => false, "error" => "config block not found"];
   }
 
-  $pwd = $new["PASSWORD_HASH"] ?? null;
-  $ipA = array_values(
-    array_filter(
-      array_map("trim", (array) ($new["IP_ALLOW"] ?? [])),
-      fn($x) => $x !== ""
-    )
-  );
+  $pwd     = $new["PASSWORD_HASH"] ?? null;
+  $ipA     = array_values(array_filter(array_map("trim", (array)($new["IP_ALLOW"] ?? [])), fn($x) => $x !== ""));
+  $runRoot = !empty($new["RUN_AS_ROOT"]);
+
   $pwdCode = $pwd === null ? "null" : var_export($pwd, true);
-  $ipCode = var_export($ipA, true);
+  $ipCode  = var_export($ipA, true);
+  $runCode = $runRoot ? 'true' : 'false';
 
   $block =
-    $startTag .
-    "\n" .
+    $startTag . "\n" .
     "\$APP_CONFIG = [\n" .
     "  'PASSWORD_HASH' => {$pwdCode},\n" .
     "  'IP_ALLOW'      => {$ipCode},\n" .
+    "  'RUN_AS_ROOT'   => {$runCode},\n" .
     "];\n" .
     $endTag;
 
-  $before = substr($code, 0, $start);
-  $after = substr($code, $end + strlen($endTag));
+  $before  = substr($code, 0, $start);
+  $after   = substr($code, $end + strlen($endTag));
   $newCode = $before . $block . $after;
 
   $ok = @file_put_contents($self, $newCode, LOCK_EX);
-  return $ok === false
-    ? ["ok" => false, "error" => "write self failed"]
-    : ["ok" => true];
+  if ($ok !== false) return ["ok" => true];
+
+  if (app_run_as_root_enabled()) {
+    $tmp = @tempnam(sys_get_temp_dir(), 'atkfm_cfg_');
+    if ($tmp === false || @file_put_contents($tmp, $newCode) === false) {
+      return ["ok" => false, "error" => "write temp failed"];
+    }
+    $out = []; $rc = 0;
+    exec_sudo('install -m 0644 ' . escapeshellarg($tmp) . ' ' . escapeshellarg($self) . ' 2>&1', $out, $rc);
+    @unlink($tmp);
+    if ($rc === 0) return ["ok" => true];
+    return ["ok" => false, "error" => "write self failed (sudo): " . implode("\n", $out)];
+  }
+
+  return ["ok" => false, "error" => "write self failed"];
 }
 
 // 設定用のAPI
@@ -225,6 +239,8 @@ function action_config_get(array $APP_CONFIG): void
       "hasPassword" => !empty($APP_CONFIG["PASSWORD_HASH"]),
       "ipAllow" => $APP_CONFIG["IP_ALLOW"],
       "clientIp" => client_ip(),
+      "runAsRoot" => !empty($APP_CONFIG["RUN_AS_ROOT"]),
+      "serverUser" => app_web_user(),
     ],
     JSON_UNESCAPED_UNICODE
   );
@@ -325,6 +341,16 @@ function action_config_set(array $APP_CONFIG): void
       JSON_UNESCAPED_UNICODE
     );
     exit();
+  } elseif ($type === "run-as-root") {
+    $enabled = !empty($j["enabled"]);
+    $new = $APP_CONFIG;
+    $new["RUN_AS_ROOT"] = (bool)$enabled;
+    $w = cfg_write($new);
+    echo json_encode(
+      $w["ok"] ? ["ok" => true, "runAsRoot" => $new["RUN_AS_ROOT"]] : ["ok" => false, "error" => $w["error"] ?? "write failed"],
+      JSON_UNESCAPED_UNICODE
+    );
+    exit();
   } else {
     echo json_encode(["ok" => false, "error" => "unknown change"], JSON_UNESCAPED_UNICODE);
     exit();
@@ -377,6 +403,151 @@ auth_gate($APP_CONFIG);
 
 if (session_status() !== PHP_SESSION_ACTIVE) { @session_start(); }
 csrf_token();
+
+// root権限実行時の関数
+function app_run_as_root_enabled(): bool
+{
+  global $APP_CONFIG;
+  return !empty($APP_CONFIG['RUN_AS_ROOT']);
+}
+
+function app_web_user(): string
+{
+  if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+    $u = @posix_getpwuid(@posix_geteuid());
+    if (is_array($u) && !empty($u['name'])) return (string)$u['name'];
+  }
+  $env = getenv('APACHE_RUN_USER') ?: (getenv('USER') ?: '');
+  if ($env !== '') return $env;
+  return current_user_name() ?: 'apache';
+}
+
+function sudo_prefix(): string
+{
+  if (!app_run_as_root_enabled()) return '';
+  return 'sudo -n ';
+}
+
+function exec_sudo(string $cmd, array &$out = null, int &$rc = null): void
+{
+  $out = [];
+  $rc  = 0;
+  @exec(sudo_prefix() . $cmd, $out, $rc);
+}
+
+function proc_open_sudo_linux(string $cmd, array $descriptorspec, array &$pipes, ?string $cwd = null, ?array $env = null)
+{
+  if (app_run_as_root_enabled()) {
+    $cmd = 'sudo -n ' . $cmd;
+  }
+  return @proc_open($cmd, $descriptorspec, $pipes, $cwd, $env);
+}
+// root権限によるATK-FM操作
+function root_fs_write(string $path, string $data, bool $append = false): bool
+{
+  $flags = $append ? FILE_APPEND : 0;
+  $ok = @file_put_contents($path, $data, $flags | LOCK_EX);
+  if ($ok !== false) return true;
+
+  if (!app_run_as_root_enabled()) return false;
+
+  $tmp = @tempnam(sys_get_temp_dir(), 'atkfm_w_');
+  if ($tmp === false) return false;
+  $w = @file_put_contents($tmp, $data);
+  if ($w === false) { @unlink($tmp); return false; }
+
+  $cmd = 'install -m 0644 ' . escapeshellarg($tmp) . ' ' . escapeshellarg($path);
+  $out = []; $rc = 0; exec_sudo($cmd, $out, $rc);
+  @unlink($tmp);
+  return $rc === 0;
+}
+
+function root_fs_mkdir(string $dir, int $mode = 0705, bool $recursive = true): bool
+{
+  if (@mkdir($dir, $mode, $recursive)) return true;
+  if (!app_run_as_root_enabled()) return false;
+
+  $perm = sprintf('%o', $mode & 0777);
+  $cmd = 'mkdir -p ' . escapeshellarg($dir) . ' && chmod ' . $perm . ' ' . escapeshellarg($dir);
+  $out = []; $rc = 0; exec_sudo($cmd, $out, $rc);
+  return $rc === 0;
+}
+
+function root_fs_unlink(string $path): bool
+{
+  if (@unlink($path)) return true;
+  if (!app_run_as_root_enabled()) return false;
+
+  $out = []; $rc = 0; exec_sudo('rm -f ' . escapeshellarg($path) . ' 2>&1', $out, $rc);
+  return $rc === 0;
+}
+
+function root_fs_rmdir_recursive(string $dir): bool
+{
+  if (remove_directory($dir)) return true;
+  if (!app_run_as_root_enabled()) return false;
+
+  $out = []; $rc = 0; exec_sudo('rm -rf ' . escapeshellarg($dir) . ' 2>&1', $out, $rc);
+  return $rc === 0;
+}
+
+function root_fs_rename(string $old, string $new): bool
+{
+  if (@rename($old, $new)) return true;
+  if (!app_run_as_root_enabled()) return false;
+
+  $out = []; $rc = 0; exec_sudo('mv -f ' . escapeshellarg($old) . ' ' . escapeshellarg($new) . ' 2>&1', $out, $rc);
+  return $rc === 0;
+}
+
+function root_fs_copy(string $src, string $dst): bool
+{
+  if (is_dir($src)) {
+    if (dir_copy($src, $dst)) return true;
+    if (!app_run_as_root_enabled()) return false;
+    $out = []; $rc = 0; exec_sudo('cp -a ' . escapeshellarg($src) . ' ' . escapeshellarg($dst) . ' 2>&1', $out, $rc);
+    return $rc === 0;
+  } else {
+    if (@copy($src, $dst)) return true;
+    if (!app_run_as_root_enabled()) return false;
+    $out = []; $rc = 0; exec_sudo('cp -f ' . escapeshellarg($src) . ' ' . escapeshellarg($dst) . ' 2>&1', $out, $rc);
+    return $rc === 0;
+  }
+}
+
+function root_fs_read(string $path) // string|false
+{
+  $r = @file_get_contents($path);
+  if ($r !== false) return $r;
+  if (!app_run_as_root_enabled()) return false;
+
+  $out = []; $rc = 0; exec_sudo('cat ' . escapeshellarg($path) . ' 2>/dev/null', $out, $rc);
+  if ($rc !== 0) return false;
+  return implode("\n", $out);
+}
+
+function root_fs_md5(string $path) // string|false
+{
+  $h = @md5_file($path);
+  if ($h !== false) return $h;
+  if (!app_run_as_root_enabled()) return false;
+
+  $out = []; $rc = 0; exec_sudo('md5sum ' . escapeshellarg($path) . ' 2>/dev/null', $out, $rc);
+  if ($rc !== 0 || empty($out)) return false;
+  $first = trim($out[0]);
+  $sp = strpos($first, ' ');
+  return $sp === false ? $first : substr($first, 0, $sp);
+}
+
+function root_fs_move_uploaded(string $tmp, string $dest): bool
+{
+  if (@move_uploaded_file($tmp, $dest)) return true;
+  if (!app_run_as_root_enabled()) return false;
+
+  $out = []; $rc = 0; exec_sudo('install -m 0644 ' . escapeshellarg($tmp) . ' ' . escapeshellarg($dest) . ' 2>&1', $out, $rc);
+  return $rc === 0;
+}
+
 
 // ターミナルの場合だけ先に処理
 if (isset($_GET['action']) && str_starts_with((string)$_GET['action'], 'term-')) {
@@ -531,288 +702,375 @@ if (isset($_GET["ajax-typeof"]) || isset($_GET["ajaxtypeof"])) {
         }
 
         // ZIPの内部閲覧
-        if (
-          is_file(rtrim($dir, DIRECTORY_SEPARATOR)) &&
-          preg_match('/\.(zip|7z)$/i', $dir)
-        ) {
-          $list = zip_list_virtual(rtrim($dir, DIRECTORY_SEPARATOR));
+        if (is_file(rtrim($dir, DIRECTORY_SEPARATOR)) && preg_match('/\.(zip|7z)$/i', $dir)) {
+          $zipPath = rtrim($dir, DIRECTORY_SEPARATOR);
+          $src = $zipPath;
+          if (!is_readable($zipPath) && app_run_as_root_enabled()) {
+            $tmp = tempnam(sys_get_temp_dir(), 'atkfm_zip_');
+            $out=[]; $rc=0;
+            exec_sudo('cp -f '.escapeshellarg($zipPath).' '.escapeshellarg($tmp).' 2>&1', $out, $rc);
+            if ($rc===0) { $src = $tmp; } else { @unlink($tmp); }
+          }
+          $list = zip_list_virtual($src);
+          if ($src !== $zipPath) { @unlink($src); }
           if ($list === null) {
-            echo json_encode([
-              "atk-fm-error" => "(ファイル/ディレクトリは存在しません)",
-            ]);
+            echo json_encode(["atk-fm-error"=>"(ファイル/ディレクトリは存在しません)"], JSON_UNESCAPED_UNICODE);
             break;
           }
-          $_SESSION["cd"] =
-            realpath(rtrim($dir, DIRECTORY_SEPARATOR)) ?: $_SESSION["cd"];
+          $_SESSION["cd"] = realpath(rtrim($dir, DIRECTORY_SEPARATOR)) ?: $_SESSION["cd"];
           $ret = [];
-          foreach ($list as $p) {
-            $ret[$p] = "d";
-          }
+          foreach ($list as $p) { $ret[$p] = "d"; }
           echo json_encode($ret, JSON_UNESCAPED_UNICODE);
           break;
         }
 
-        if (!is_dir($dir)) {
-          echo json_encode(
-            [
-              "atk-fm-error" =>
-                "指定されたディレクトリが存在しない、又はアクセスが拒否されました。",
-            ],
-            JSON_UNESCAPED_UNICODE
-          );
-          break;
-        }
-        $glob = @glob($dir . "{*,.*}", GLOB_BRACE);
-        $out = [];
-        if ($glob) {
-          foreach ($glob as $p) {
-            if (in_array(basename($p), [".", ".."], true)) {
-              continue;
+        if (is_dir($dir)) {
+          $glob = @glob($dir . "{*,.*}", GLOB_BRACE);
+          $out = [];
+          if ($glob) {
+            foreach ($glob as $p) {
+              if (in_array(basename($p), [".", ".."], true)) continue;
+              if (is_dir($p)) {
+                $out[$p] = "b";
+              } elseif (is_file($p)) {
+                $ext = strtolower(pathinfo($p, PATHINFO_EXTENSION));
+                if (in_array($ext, ["zip","7z","rar","gz","bz2","lzh"], true)) { $out[$p] = "c";
+                } elseif ($ext === "atkfm-link") { $out[$p] = "e";
+                } elseif ($ext === "atkfm-encrypt") { $out[$p] = "f";
+                } else { $out[$p] = "a"; }
+              }
             }
-            if (is_dir($p)) {
-              $out[$p] = "b";
-            } elseif (is_file($p)) {
-              $ext = strtolower(pathinfo($p, PATHINFO_EXTENSION));
-              if (
-                in_array($ext, ["zip", "7z", "rar", "gz", "bz2", "lzh"], true)
-              ) {
-                $out[$p] = "c";
-              } elseif ($ext === "atkfm-link") {
-                $out[$p] = "e";
-              } elseif ($ext === "atkfm-encrypt") {
-                $out[$p] = "f";
-              } else {
-                $out[$p] = "a";
+          } else if (app_run_as_root_enabled()) {
+            $outLines=[]; $rc=0;
+            exec_sudo('find '.escapeshellarg(rtrim($dir, DIRECTORY_SEPARATOR)).' -maxdepth 1 -mindepth 1 -printf "%p\t%y\n" 2>/dev/null', $outLines, $rc);
+            $out = [];
+            if ($rc===0) {
+              foreach ($outLines as $ln) {
+                [$p,$t] = array_map('trim', explode("\t", $ln, 2)+['','']);
+                if ($p==='' || preg_match('#/(?:\.|\.\.)$#', $p)) continue;
+                if ($t==='d') {
+                  $out[$p] = "b";
+                } elseif ($t==='f') {
+                  $ext = strtolower(pathinfo($p, PATHINFO_EXTENSION));
+                  if (in_array($ext, ["zip","7z","rar","gz","bz2","lzh"], true)) { $out[$p] = "c";
+                  } elseif ($ext === "atkfm-link") { $out[$p] = "e";
+                  } elseif ($ext === "atkfm-encrypt") { $out[$p] = "f";
+                  } else { $out[$p] = "a"; }
+                }
               }
             }
           }
+          $_SESSION["cd"] = realpath($dir) ?: $_SESSION["cd"];
+          if (empty($out)) $out = ["atk-fm-error"=>"(ファイル/ディレクトリは存在しません)"];
+          echo json_encode($out, JSON_UNESCAPED_UNICODE);
+          break;
         }
-        $_SESSION["cd"] = realpath($dir) ?: $_SESSION["cd"];
-        if (empty($out)) {
-          $out = ["atk-fm-error" => "(ファイル/ディレクトリは存在しません)"];
+
+        // ここまでで取れなければsudoでも不可
+        if (app_run_as_root_enabled()) {
+          $chk=[]; $rc=0;
+          exec_sudo('test -d '.escapeshellarg($dir), $chk, $rc);
+          if ($rc!==0) {
+            echo json_encode(["atk-fm-error"=>"指定されたディレクトリが存在しない、又はアクセスが拒否されました。"], JSON_UNESCAPED_UNICODE);
+            break;
+          }
+          // sudo findで列挙
+          $outLines=[]; $rc=0;
+          exec_sudo('find '.escapeshellarg(rtrim($dir, DIRECTORY_SEPARATOR)).' -maxdepth 1 -mindepth 1 -printf "%p\t%y\n" 2>/dev/null', $outLines, $rc);
+          $out = [];
+          if ($rc===0) {
+            foreach ($outLines as $ln) {
+              [$p,$t] = array_map('trim', explode("\t", $ln, 2)+['','']);
+              if ($p==='' || preg_match('#/(?:\.|\.\.)$#', $p)) continue;
+              if ($t==='d') {
+                $out[$p] = "b";
+              } elseif ($t==='f') {
+                $ext = strtolower(pathinfo($p, PATHINFO_EXTENSION));
+                if (in_array($ext, ["zip","7z","rar","gz","bz2","lzh"], true)) { $out[$p] = "c";
+                } elseif ($ext === "atkfm-link") { $out[$p] = "e";
+                } elseif ($ext === "atkfm-encrypt") { $out[$p] = "f";
+                } else { $out[$p] = "a"; }
+              }
+            }
+          }
+          $_SESSION["cd"] = rtrim($dir, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR;
+          if (empty($out)) $out = ["atk-fm-error"=>"(ファイル/ディレクトリは存在しません)"];
+          echo json_encode($out, JSON_UNESCAPED_UNICODE);
+          break;
         }
-        echo json_encode($out, JSON_UNESCAPED_UNICODE);
+
+        echo json_encode(["atk-fm-error"=>"指定されたディレクトリが存在しない、又はアクセスが拒否されました。"], JSON_UNESCAPED_UNICODE);
         break;
 
       case "get-item":
       case "getitem":
-        if (!file_exists($opt)) {
-          http_response_code(404);
-          echo "エラー: ファイルが見つかりません。";
-          break;
+        if (!file_exists($opt) && app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('test -e '.escapeshellarg($opt), $out, $rc);
+          if ($rc!==0) { http_response_code(404); echo "エラー: ファイルが見つかりません。"; break; }
+        } elseif (!file_exists($opt)) {
+          http_response_code(404); echo "エラー: ファイルが見つかりません。"; break;
         }
         if (isset($_GET["accept"])) {
           $mime = $_GET["accept"];
           header("Content-Type: " . $mime);
-          header("Content-Length: " . filesize($opt));
-          header(
-            'Content-Disposition: inline; filename="' . basename($opt) . '"'
-          );
-          while (ob_get_level()) {
-            ob_end_clean();
+          if (is_readable($opt)) {
+            header("Content-Length: " . filesize($opt));
+            header('Content-Disposition: inline; filename="' . basename($opt) . '"');
+            while (ob_get_level()) { ob_end_clean(); }
+            readfile($opt);
+          } else if (app_run_as_root_enabled()) {
+            header('Content-Disposition: inline; filename="'.basename($opt).'"');
+            while (ob_get_level()) { ob_end_clean(); }
+            $des = [0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];
+            $p = proc_open_sudo_linux('cat '.escapeshellarg($opt), $des, $pipes, null, null);
+            if (is_resource($p)) {
+              fclose($pipes[0]);
+              fpassthru($pipes[1]);
+              fclose($pipes[1]); fclose($pipes[2]); proc_close($p);
+            } else {
+              echo "読み込みに失敗しました。";
+            }
+          } else {
+            echo "ファイルを読み込めませんでした。";
           }
-          readfile($opt);
           break;
         }
-        ViewNotePad($opt);
+        $viewPath = $opt;
+        if (!is_readable($opt) && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_view_');
+          $out=[]; $rc=0; exec_sudo('cp -f '.escapeshellarg($opt).' '.escapeshellarg($tmp).' 2>&1', $out, $rc);
+          if ($rc===0) { $viewPath = $tmp; }
+        }
+        ViewNotePad($viewPath);
+        if ($viewPath !== $opt) { @unlink($viewPath); }
         break;
 
       case "get-item-pre":
       case "getitempre":
         header("Content-Type: text/html; charset=utf-8");
-        if (!file_exists($opt)) {
-          echo "エラー: ファイルが見つかりません。";
-          break;
+        if (!file_exists($opt) && app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('test -e '.escapeshellarg($opt), $out, $rc);
+          if ($rc!==0) { echo "エラー: ファイルが見つかりません。"; break; }
+        } elseif (!file_exists($opt)) {
+          echo "エラー: ファイルが見つかりません。"; break;
         }
-        echo "<pre>";
-        echo htmlspecialchars(
-          file_get_contents($opt),
-          ENT_QUOTES | ENT_SUBSTITUTE,
-          "UTF-8"
-        );
-        echo "</pre>";
+        $txt = @file_get_contents($opt);
+        if ($txt === false && app_run_as_root_enabled()) {
+          $lines=[]; $rc=0; exec_sudo('cat '.escapeshellarg($opt).' 2>/dev/null', $lines, $rc);
+          $txt = ($rc===0) ? implode("\n", $lines) : '';
+        }
+        echo "<pre>".htmlspecialchars($txt, ENT_QUOTES | ENT_SUBSTITUTE, "UTF-8")."</pre>";
         break;
 
       case "get-linkto":
       case "getlinkto":
         header("Content-Type: text/plain; charset=utf-8");
-        echo is_file($opt)
-          ? rawurlencode((string) @file_get_contents($opt))
-          : "";
+        if (is_file($opt) && is_readable($opt)) {
+          echo rawurlencode((string)@file_get_contents($opt));
+        } elseif (app_run_as_root_enabled()) {
+          $lines=[]; $rc=0; exec_sudo('cat '.escapeshellarg($opt).' 2>/dev/null', $lines, $rc);
+          echo ($rc===0) ? rawurlencode(implode("\n",$lines)) : "";
+        } else {
+          echo "";
+        }
         break;
 
       case "view-html":
       case "viewhtml":
         header("Content-Type: text/html; charset=utf-8");
-        if (!file_exists($opt)) {
-          echo "エラー: ファイルが見つかりません。";
-          break;
+        if (!file_exists($opt) && app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('test -e '.escapeshellarg($opt), $out, $rc);
+          if ($rc!==0) { echo "エラー: ファイルが見つかりません。"; break; }
+        } elseif (!file_exists($opt)) {
+          echo "エラー: ファイルが見つかりません。"; break;
         }
-        $base = $opt2
-          ? "<base href=\"" . htmlspecialchars($opt2, ENT_QUOTES) . "\">\n"
-          : "";
-        echo $base . (string) file_get_contents($opt);
+        $base = $opt2 ? "<base href=\"".htmlspecialchars($opt2, ENT_QUOTES)."\">\n" : "";
+        $html = @file_get_contents($opt);
+        if ($html === false && app_run_as_root_enabled()) {
+          $lines=[]; $rc=0; exec_sudo('cat '.escapeshellarg($opt).' 2>/dev/null', $lines, $rc);
+          $html = ($rc===0) ? implode("\n",$lines) : "エラー: 読み込み失敗";
+        }
+        echo $base . (string)$html;
         break;
 
       case "view-hex":
       case "viewhex":
         header("Content-Type: text/html; charset=utf-8");
-        if (!file_exists($opt)) {
-          echo "エラー: ファイルが見つかりません。";
-          break;
+        if (!file_exists($opt) && app_run_as_root_enabled()) {
+          $o=[]; $rc=0; exec_sudo('test -e '.escapeshellarg($opt), $o, $rc);
+          if ($rc!==0) { echo "エラー: ファイルが見つかりません。"; break; }
+        } elseif (!file_exists($opt)) { echo "エラー: ファイルが見つかりません。"; break; }
+        $tgt = $opt;
+        if (!is_readable($opt) && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_hex_');
+          $o=[]; $rc=0; exec_sudo('cp -f '.escapeshellarg($opt).' '.escapeshellarg($tmp).' 2>&1', $o, $rc);
+          if ($rc===0) $tgt = $tmp;
         }
-        hex_dump_html($opt);
+        hex_dump_html($tgt);
+        if ($tgt !== $opt) { @unlink($tgt); }
         break;
 
       case "remove-directory":
       case "removedirectory":
         header("Content-Type: text/plain; charset=utf-8");
-        if (!file_exists($opt)) {
-          echo "Error: 指定されたディレクトリは存在しません。";
-          break;
+        if (!file_exists($opt)) { echo "Error: 指定されたディレクトリは存在しません。"; break; }
+        if (remove_directory($opt)) { echo "ディレクトリを削除しました。"; break; }
+        if (app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('rm -rf '.escapeshellarg($opt).' 2>&1', $out, $rc);
+          echo ($rc===0) ? "ディレクトリを削除しました。" : "Error: 削除に失敗しました。";
+        } else {
+          echo "Error: 削除に失敗しました。";
         }
-        echo remove_directory($opt)
-          ? "ディレクトリを削除しました。"
-          : "Error: 削除に失敗しました。";
         break;
 
       case "remove-item":
       case "removeitem":
         header("Content-Type: text/plain; charset=utf-8");
-        if (!file_exists($opt)) {
-          echo "Error: 指定されたファイルは存在しません。";
-          break;
+        if (@unlink($opt)) { echo ""; break; }
+        if (app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('rm -f '.escapeshellarg($opt).' 2>&1', $out, $rc);
+          echo ($rc===0) ? "" : "Error: 指定されたファイルを削除できません。";
+        } else {
+          echo "Error: 指定されたファイルを削除できません。";
         }
-        echo @unlink($opt) ? "" : "Error: 指定されたファイルを削除できません。";
         break;
 
       case "download-item":
       case "downloaditem":
-        if (!is_readable($opt)) {
-          echo "ファイルを読み込めませんでした。";
-          break;
+        if (!file_exists($opt) && app_run_as_root_enabled()) {
+          $o=[]; $rc=0; exec_sudo('test -e '.escapeshellarg($opt), $o, $rc);
+          if ($rc!==0) { echo "ファイルを読み込めませんでした。"; break; }
+        } elseif (!is_readable($opt)) {
+          if (!app_run_as_root_enabled()) { echo "ファイルを読み込めませんでした。"; break; }
         }
         header("Content-Type: application/octet-stream");
         header("X-Content-Type-Options: nosniff");
-        header("Content-Length: " . filesize($opt));
-        header(
-          'Content-Disposition: attachment; filename="' . basename($opt) . '"'
-        );
-        while (ob_get_level()) {
-          ob_end_clean();
+        header('Content-Disposition: attachment; filename="'.basename($opt).'"');
+        while (ob_get_level()) { ob_end_clean(); }
+        if (is_readable($opt)) {
+          header("Content-Length: " . filesize($opt));
+          readfile($opt);
+        } else {
+          $des=[0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];
+          $p = proc_open_sudo_linux('cat '.escapeshellarg($opt), $des, $pipes, null, null);
+          if (is_resource($p)) {
+            fclose($pipes[0]);
+            fpassthru($pipes[1]);
+            fclose($pipes[1]); fclose($pipes[2]); proc_close($p);
+          } else {
+            echo "読み込みに失敗しました。";
+          }
         }
-        readfile($opt);
         break;
 
       case "upload-item":
       case "uploaditem":
         header("Content-Type: text/plain; charset=utf-8");
         $errors = [];
-        if (!isset($_FILES["file"])) {
-          echo "アップロード対象がありません。";
-          break;
-        }
-        $count = is_array($_FILES["file"]["name"])
-          ? count($_FILES["file"]["name"])
-          : 0;
-        for ($i = 0; $i < $count; $i++) {
+        if (!isset($_FILES["file"])) { echo "アップロード対象がありません。"; break; }
+        $count = is_array($_FILES["file"]["name"]) ? count($_FILES["file"]["name"]) : 0;
+        for ($i=0; $i<$count; $i++) {
           if (is_uploaded_file($_FILES["file"]["tmp_name"][$i])) {
-            $dest =
-              rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-              DIRECTORY_SEPARATOR .
-              basename($_FILES["file"]["name"][$i]);
-            if (!@move_uploaded_file($_FILES["file"]["tmp_name"][$i], $dest)) {
-              $errors[] =
-                $_FILES["file"]["name"][$i] .
-                " をアップロードできませんでした。";
+            $dest = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.basename($_FILES["file"]["name"][$i]);
+            // まずは自前の一時領域に移動
+            $tmp = tempnam(sys_get_temp_dir(), 'atkfm_up_');
+            if (!@move_uploaded_file($_FILES["file"]["tmp_name"][$i], $tmp)) {
+              $errors[] = $_FILES["file"]["name"][$i] . " をアップロードできませんでした。";
+              continue;
             }
+            // 上書きできない場合はsudoでコピー
+            if (@copy($tmp, $dest) === false) {
+              if (app_run_as_root_enabled()) {
+                $out=[]; $rc=0; exec_sudo('install -m 0644 -D '.escapeshellarg($tmp).' '.escapeshellarg($dest).' 2>&1', $out, $rc);
+                if ($rc!==0) $errors[] = $_FILES["file"]["name"][$i] . " をアップロードできませんでした。";
+              } else {
+                $errors[] = $_FILES["file"]["name"][$i] . " をアップロードできませんでした。";
+              }
+            }
+            @unlink($tmp);
           }
         }
-        echo empty($errors)
-          ? "ファイルをアップロードしました。"
-          : implode("\n", $errors);
+        echo empty($errors) ? "ファイルをアップロードしました。" : implode("\n", $errors);
         break;
 
       case "min-upload-item":
       case "minuploaditem":
         header("Content-Type: application/json; charset=utf-8");
         if ($opt === "remove-upload-info" && isset($_POST["FileName"])) {
-          $jsonname =
-            rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-            "/_upload-beacon_" .
-            basename($_POST["FileName"]) .
-            ".json.atkfmbeacon";
-          echo json_encode(
-            @unlink($jsonname) ? "" : "error",
-            JSON_UNESCAPED_UNICODE
-          );
+          $jsonname = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR)."/_upload-beacon_".basename($_POST["FileName"]).".json.atkfmbeacon";
+          $ok = @unlink($jsonname);
+          if (!$ok && app_run_as_root_enabled()) {
+            $out=[];$rc=0; exec_sudo('rm -f '.escapeshellarg($jsonname).' 2>&1', $out, $rc);
+            $ok = ($rc===0);
+          }
+          echo json_encode($ok ? "" : "error", JSON_UNESCAPED_UNICODE);
           break;
         }
         if (!isset($_POST["filename"]) || !isset($_FILES["data"])) {
-          echo json_encode(["error" => "missing fields"]);
-          break;
+          echo json_encode(["error"=>"missing fields"]); break;
         }
-        $dest =
-          rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-          DIRECTORY_SEPARATOR .
-          basename($_POST["filename"]);
-        $ok = @file_put_contents(
-          $dest,
-          file_get_contents($_FILES["data"]["tmp_name"]),
-          FILE_APPEND
-        );
-        $jsonname =
-          rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-          "/_upload-beacon_" .
-          basename($_POST["filename"]) .
-          ".json.atkfmbeacon";
-        @file_put_contents(
-          $jsonname,
-          json_encode(["size" => @filesize($dest)])
-        );
+        $dest = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.basename($_POST["filename"]);
+        $tmp = $_FILES["data"]["tmp_name"];
+        $ok = @file_put_contents($dest, file_get_contents($tmp), FILE_APPEND);
+        if ($ok === false && app_run_as_root_enabled()) {
+          // 一旦tmpにコピーして cat >> で追記
+          $chunkTmp = tempnam(sys_get_temp_dir(), 'atkfm_chunk_');
+          @copy($tmp, $chunkTmp);
+          $out=[]; $rc=0; exec_sudo('sh -lc "cat '.escapeshellarg($chunkTmp).' >> '.escapeshellarg($dest).'" 2>&1', $out, $rc);
+          @unlink($chunkTmp);
+        }
         echo json_encode(["size" => @filesize($dest)], JSON_UNESCAPED_UNICODE);
         break;
 
       case "uploadfromurl":
         header("Content-Type: text/plain; charset=utf-8");
         $fn = basename(parse_url($opt, PHP_URL_PATH) ?: "NoName.txt");
-        $dest =
-          rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-          DIRECTORY_SEPARATOR .
-          substr($fn, 0, 120);
-        download($opt, $dest);
+        $dest = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.substr($fn, 0, 120);
+        // まずは一時ファイルにダウンロード
+        $tmp = tempnam(sys_get_temp_dir(), 'atkfm_dl_');
+        download($opt, $tmp);
+        if (@copy($tmp, $dest) === false && app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('install -m 0644 -D '.escapeshellarg($tmp).' '.escapeshellarg($dest).' 2>&1', $out, $rc);
+        }
+        @unlink($tmp);
         echo "URLから{$dest}をアップロードしました。";
         break;
 
       case "add-item":
       case "additem":
         header("Content-Type: text/plain; charset=utf-8");
-        $dest =
-          rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-          DIRECTORY_SEPARATOR .
-          $opt;
-        echo @file_put_contents($dest, "") !== false ? "1" : "0";
+        $dest = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.$opt;
+        $ok = (@file_put_contents($dest, "") !== false);
+        if (!$ok && app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('sh -lc "umask 022; : > '.escapeshellarg($dest).'" 2>&1', $out, $rc);
+          $ok = ($rc===0);
+        }
+        echo $ok ? "1" : "0";
         break;
 
       case "create-link":
       case "createlink":
         header("Content-Type: text/plain; charset=utf-8");
-        echo @file_put_contents(
-          $opt,
-          rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR
-        ) !== false
-          ? "1"
-          : "0";
+        $content = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR;
+        $ok = (@file_put_contents($opt, $content) !== false);
+        if (!$ok && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_link_');
+          @file_put_contents($tmp, $content);
+          $out=[]; $rc=0; exec_sudo('install -m 0644 -D '.escapeshellarg($tmp).' '.escapeshellarg($opt).' 2>&1', $out, $rc);
+          @unlink($tmp);
+          $ok = ($rc===0);
+        }
+        echo $ok ? "1" : "0";
         break;
 
       case "add-directory":
       case "adddirectory":
         header("Content-Type: text/plain; charset=utf-8");
-        $dest =
-          rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-          DIRECTORY_SEPARATOR .
-          rtrim($opt, DIRECTORY_SEPARATOR);
+        $dest = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.rtrim($opt, DIRECTORY_SEPARATOR);
         @mkdir($dest, 0705, true);
+        if (!is_dir($dest) && app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('mkdir -p '.escapeshellarg($dest).' 2>&1', $out, $rc);
+        }
         echo "";
         break;
 
@@ -820,26 +1078,35 @@ if (isset($_GET["ajax-typeof"]) || isset($_GET["ajaxtypeof"])) {
       case "openzip":
         header("Content-Type: text/plain; charset=utf-8");
         $zip = new ZipArchive();
-        if ($zip->open($opt) !== true) {
-          echo "ファイルの展開に失敗しました。";
-          break;
+        $okPHP = ($zip->open($opt) === true);
+        $unzip_dir = rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.pathinfo($opt, PATHINFO_FILENAME);
+        if ($okPHP) {
+          @mkdir($unzip_dir, 0755, true);
+          $ok = @$zip->extractTo($unzip_dir);
+          $zip->close();
+          if ($ok) { echo "展開に成功しました!({$unzip_dir})"; break; }
         }
-        $unzip_dir =
-          rtrim($_SESSION["cd"], DIRECTORY_SEPARATOR) .
-          DIRECTORY_SEPARATOR .
-          pathinfo($opt, PATHINFO_FILENAME);
-        @mkdir($unzip_dir, 0755, true);
-        $ok = @$zip->extractTo($unzip_dir);
-        $zip->close();
-        echo $ok
-          ? "展開に成功しました!({$unzip_dir})"
-          : "ファイルの展開に失敗しました。";
+        if (app_run_as_root_enabled()) {
+          $out=[]; $rc=0;
+          exec_sudo('sh -lc "umask 022; mkdir -p '.escapeshellarg($unzip_dir).'; (unzip -o '.escapeshellarg($opt).' -d '.escapeshellarg($unzip_dir).' || 7z x -y '.escapeshellarg($opt).' -o'.escapeshellarg($unzip_dir).')" 2>&1', $out, $rc);
+          echo ($rc===0) ? "展開に成功しました!({$unzip_dir})" : "ファイルの展開に失敗しました。";
+        } else {
+          echo "ファイルの展開に失敗しました。";
+        }
         break;
 
       case "make-zip":
       case "makezip":
         header("Content-Type: text/plain; charset=utf-8");
         $ok = zipDirectory($opt, $opt . ".zip");
+        if (!$ok && app_run_as_root_enabled()) {
+          $dir = $opt;
+          $parent = dirname($dir);
+          $base = basename($dir);
+          $out=[]; $rc=0;
+          exec_sudo('sh -lc "cd '.escapeshellarg($parent).' && zip -r '.escapeshellarg($base.'.zip').' '.escapeshellarg($base).'" 2>&1', $out, $rc);
+          $ok = ($rc===0);
+        }
         echo $ok ? "フォルダーを圧縮しました。" : "圧縮に失敗しました。";
         break;
 
@@ -849,9 +1116,17 @@ if (isset($_GET["ajax-typeof"]) || isset($_GET["ajaxtypeof"])) {
         if (is_dir($opt)) {
           $dest = $opt . " (コピー)";
           $ok = dir_copy($opt, $dest);
+          if (!$ok && app_run_as_root_enabled()) {
+            $out=[]; $rc=0; exec_sudo('cp -a '.escapeshellarg($opt).' '.escapeshellarg($dest).' 2>&1', $out, $rc);
+            $ok = ($rc===0);
+          }
           echo $ok ? "OK" : "NG";
         } else {
           $ok = @copy($opt, $opt . " (コピー)");
+          if (!$ok && app_run_as_root_enabled()) {
+            $out=[]; $rc=0; exec_sudo('cp -f '.escapeshellarg($opt).' '.escapeshellarg($opt . " (コピー)").' 2>&1', $out, $rc);
+            $ok = ($rc===0);
+          }
           echo $ok ? "OK" : "NG";
         }
         break;
@@ -859,135 +1134,178 @@ if (isset($_GET["ajax-typeof"]) || isset($_GET["ajaxtypeof"])) {
       case "rename-item":
       case "renameitem":
         header("Content-Type: text/plain; charset=utf-8");
-        echo @rename($opt, $opt2) ? "1" : "0";
+        $ok = @rename($opt, $opt2);
+        if (!$ok && app_run_as_root_enabled()) {
+          $out=[]; $rc=0; exec_sudo('mv -f '.escapeshellarg($opt).' '.escapeshellarg($opt2).' 2>&1', $out, $rc);
+          $ok = ($rc===0);
+        }
+        echo $ok ? "1" : "0";
         break;
 
       case "count-directory-files":
       case "countdirectoryfiles":
         header("Content-Type: application/json; charset=utf-8");
+
+        $saved_cd = $_SESSION["cd"] ?? null;
+        if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+
         $start = microtime(true);
-        $filesCnt = 0;
-        $dirsCnt = 0;
+        $filesCnt = 0; $dirsCnt = 0; $sizeHuman = "0.00KB";
         if (is_dir($opt)) {
-          $iter = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator(
-              $opt,
-              FilesystemIterator::CURRENT_AS_FILEINFO |
-                FilesystemIterator::KEY_AS_PATHNAME |
-                FilesystemIterator::SKIP_DOTS
-            ),
-            RecursiveIteratorIterator::SELF_FIRST
-          );
-          foreach ($iter as $path => $info) {
-            $info->isFile() ? $filesCnt++ : $dirsCnt++;
+          try {
+            $iter = new RecursiveIteratorIterator(
+              new RecursiveDirectoryIterator($opt, FilesystemIterator::CURRENT_AS_FILEINFO | FilesystemIterator::KEY_AS_PATHNAME | FilesystemIterator::SKIP_DOTS),
+              RecursiveIteratorIterator::SELF_FIRST
+            );
+            foreach ($iter as $path => $info) { $info->isFile() ? $filesCnt++ : $dirsCnt++; }
+            $sizeHuman = used_bytes(rtrim($opt, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR);
+          } catch (Throwable $e) {
+            // 通常の読み取りに失敗したらsudo findで集計
+            if (app_run_as_root_enabled()) {
+              $o=[]; $rc=0;
+              exec_sudo('find '.escapeshellarg($opt).' -type f -printf "." | wc -c', $o, $rc);
+              if ($rc===0) $filesCnt = (int)trim($o[0] ?? '0');
+              $o=[]; $rc=0;
+              exec_sudo('find '.escapeshellarg($opt).' -type d -printf "." | wc -c', $o, $rc);
+              if ($rc===0) $dirsCnt = (int)trim($o[0] ?? '0');
+              $o=[]; $rc=0;
+              exec_sudo('sh -lc "du -sb '.escapeshellarg($opt).' | awk \'{print $1}\'"', $o, $rc);
+              if ($rc===0) $sizeHuman = used_bytes(rtrim($opt, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR);
+            }
           }
         }
-        echo json_encode(
-          [
-            "File" => $filesCnt,
-            "Directory" => $dirsCnt,
-            "Time" => microtime(true) - $start,
-            "SIZE" => used_bytes(
-              rtrim($opt, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR
-            ),
-          ],
-          JSON_UNESCAPED_UNICODE
-        );
+        echo json_encode(["File"=>$filesCnt, "Directory"=>$dirsCnt, "Time"=>microtime(true)-$start, "SIZE"=>$sizeHuman], JSON_UNESCAPED_UNICODE);
         break;
 
       case "get-filesize":
       case "getfilesize":
         header("Content-Type: text/plain; charset=utf-8");
-        echo calcFileSize(@filesize($opt));
+        $sz = @filesize($opt);
+        if ($sz === false && app_run_as_root_enabled()) {
+          $o=[]; $rc=0; exec_sudo('stat -c %s '.escapeshellarg($opt).' 2>/dev/null', $o, $rc);
+          if ($rc===0) $sz = (int)trim($o[0] ?? '0');
+        }
+        echo calcFileSize(is_numeric($sz) ? $sz : 0);
         break;
 
       case "save-item":
       case "saveitem":
         header("Content-Type: text/plain; charset=utf-8");
         $data = $_POST["naka"] ?? "";
-        echo @file_put_contents($opt, $data) !== false ? "" : "error";
+        $ok = (@file_put_contents($opt, $data) !== false);
+        if (!$ok && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_save_');
+          @file_put_contents($tmp, $data);
+          $out=[]; $rc=0; exec_sudo('install -m 0644 -D '.escapeshellarg($tmp).' '.escapeshellarg($opt).' 2>&1', $out, $rc);
+          @unlink($tmp);
+          $ok = ($rc===0);
+        }
+        echo $ok ? "" : "error";
         break;
 
       case "get-filemd5":
       case "getfilemd5":
         header("Content-Type: text/plain; charset=utf-8");
-        echo @md5_file($opt);
+        $h = @md5_file($opt);
+        if ($h === false && app_run_as_root_enabled()) {
+          $o=[]; $rc=0; exec_sudo('md5sum '.escapeshellarg($opt).' 2>/dev/null', $o, $rc);
+          if ($rc===0 && !empty($o)) { $h = preg_split('/\s+/', trim($o[0]))[0] ?? ''; }
+        }
+        echo $h ?: "";
         break;
 
       case "encrypt-item":
       case "encryptitem":
         header("Content-Type: text/plain; charset=utf-8");
-        $enc = openssl_encrypt(
-          @file_get_contents($opt),
-          "aes-256-cbc",
-          $opt2,
-          OPENSSL_RAW_DATA,
-          "4910857128499038" // いやはや、これは正直どんな値でもいいんですが、なんとなく適当に選びました
-        );
-        if ($enc === false) {
-          echo "error";
-          break;
+        $srcPath = $opt;
+        $raw = @file_get_contents($srcPath);
+        if ($raw === false && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_enc_');
+          $o=[]; $rc=0; exec_sudo('cp -f '.escapeshellarg($opt).' '.escapeshellarg($tmp).' 2>&1', $o, $rc);
+          if ($rc===0) { $srcPath = $tmp; $raw = @file_get_contents($srcPath); }
         }
+        $enc = ($raw === false) ? false : openssl_encrypt($raw, "aes-256-cbc", $opt2, OPENSSL_RAW_DATA, "4910857128499038");
+        if ($srcPath !== $opt) { @unlink($srcPath); }
+        if ($enc === false) { echo "error"; break; }
         $dest = $opt . ".atkfm-encrypt";
-        echo @file_put_contents($dest, "ATKFMENCRYPTFILE!" . $enc) !== false
-          ? $dest
-          : "error";
+        $ok = (@file_put_contents($dest, "ATKFMENCRYPTFILE!" . $enc) !== false);
+        if (!$ok && app_run_as_root_enabled()) {
+          $tmpOut = tempnam(sys_get_temp_dir(), 'atkfm_encout_');
+          @file_put_contents($tmpOut, "ATKFMENCRYPTFILE!" . $enc);
+          $o=[]; $rc=0; exec_sudo('install -m 0644 -D '.escapeshellarg($tmpOut).' '.escapeshellarg($dest).' 2>&1', $o, $rc);
+          @unlink($tmpOut);
+          $ok = ($rc===0);
+        }
+        echo $ok ? $dest : "error";
         break;
 
       case "decrypt-item":
       case "decryptitem":
         header("Content-Type: text/plain; charset=utf-8");
-        if (
-          strtolower(pathinfo($opt, PATHINFO_EXTENSION)) !== "atkfm-encrypt"
-        ) {
-          echo "エラー: 拡張子が「.atkfm-encrypt」のファイルを選択してください。";
-          break;
+        if (strtolower(pathinfo($opt, PATHINFO_EXTENSION)) !== "atkfm-encrypt") {
+          echo "エラー: 拡張子が「.atkfm-encrypt」のファイルを選択してください。"; break;
         }
+        $src = $opt;
         $raw = @file_get_contents($opt);
+        if (($raw === false || substr($raw, 0, 16) !== "ATKFMENCRYPTFILE") && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_dec_');
+          $o=[]; $rc=0; exec_sudo('cp -f '.escapeshellarg($opt).' '.escapeshellarg($tmp).' 2>&1', $o, $rc);
+          if ($rc===0) { $src = $tmp; $raw = @file_get_contents($src); }
+        }
         if ($raw === false || substr($raw, 0, 16) !== "ATKFMENCRYPTFILE") {
-          echo "エラー: このファイルはATK-FMにより暗号化されていません。";
-          break;
+          if ($src !== $opt) @unlink($src);
+          echo "エラー: このファイルはATK-FMにより暗号化されていません。"; break;
         }
-        $dec = openssl_decrypt(
-          substr($raw, 17),
-          "aes-256-cbc",
-          $opt2,
-          OPENSSL_RAW_DATA,
-          "4910857128499038"
-        );
-        if ($dec === false) {
-          echo "エラー: パスワードが違う、又はファイルが破損しています。";
-          break;
+        $dec = openssl_decrypt(substr($raw, 17), "aes-256-cbc", $opt2, OPENSSL_RAW_DATA, "4910857128499038");
+        if ($src !== $opt) @unlink($src);
+        if ($dec === false) { echo "エラー: パスワードが違う、又はファイルが破損しています。"; break; }
+        $dst = dirname($opt).DIRECTORY_SEPARATOR.pathinfo($opt, PATHINFO_FILENAME);
+        $ok = (@file_put_contents($dst, $dec) !== false);
+        if (!$ok && app_run_as_root_enabled()) {
+          $tmpOut = tempnam(sys_get_temp_dir(), 'atkfm_decout_');
+          @file_put_contents($tmpOut, $dec);
+          $o=[]; $rc=0; exec_sudo('install -m 0644 -D '.escapeshellarg($tmpOut).' '.escapeshellarg($dst).' 2>&1', $o, $rc);
+          @unlink($tmpOut);
+          $ok = ($rc===0);
         }
-        $dst =
-          dirname($opt) .
-          DIRECTORY_SEPARATOR .
-          pathinfo($opt, PATHINFO_FILENAME);
-        echo @file_put_contents($dst, $dec) !== false
-          ? "ファイルを複合化しました。"
-          : "error";
+        echo $ok ? "ファイルを複合化しました。" : "error";
         break;
 
       case "get-item-zip":
       case "getitemzip":
         header("Content-Type: text/plain; charset=utf-8");
-        $txt = zip_read_file(rtrim($opt, DIRECTORY_SEPARATOR), $opt2);
-        if ($txt === null) {
-          echo "// テキストが空です";
-        } else {
-          echo is_utf8($txt)
-            ? $txt
-            : @mb_convert_encoding($txt, "UTF-8", "SJIS");
+        $zipSrc = rtrim($opt, DIRECTORY_SEPARATOR);
+        $local = $zipSrc;
+        if (!is_readable($zipSrc) && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_zipr_');
+          $o=[]; $rc=0; exec_sudo('cp -f '.escapeshellarg($zipSrc).' '.escapeshellarg($tmp).' 2>&1', $o, $rc);
+          if ($rc===0) $local = $tmp;
         }
+        $txt = zip_read_file($local, $opt2);
+        if ($local !== $zipSrc) @unlink($local);
+        if ($txt === null) { echo "// テキストが空です"; }
+        else { echo is_utf8($txt) ? $txt : @mb_convert_encoding($txt, "UTF-8", "SJIS"); }
         break;
 
       case "remove-item-zip":
       case "removeitemzip":
         header("Content-Type: text/plain; charset=utf-8");
+        $zipPath = rtrim($opt, DIRECTORY_SEPARATOR);
+        $local = $zipPath; $needPushBack = false;
+        if (!is_writable($zipPath) && app_run_as_root_enabled()) {
+          $tmp = tempnam(sys_get_temp_dir(), 'atkfm_zipw_');
+          $o=[]; $rc=0; exec_sudo('cp -f '.escapeshellarg($zipPath).' '.escapeshellarg($tmp).' 2>&1', $o, $rc);
+          if ($rc===0) { $local = $tmp; $needPushBack = true; }
+        }
         $zip = new ZipArchive();
-        if ($zip->open(rtrim($opt, DIRECTORY_SEPARATOR)) === true) {
+        if ($zip->open($local) === true) {
           $ok = $zip->deleteName($opt2);
           $zip->close();
+          if ($ok && $needPushBack) {
+            $o=[]; $rc=0; exec_sudo('mv -f '.escapeshellarg($local).' '.escapeshellarg($zipPath).' 2>&1', $o, $rc);
+            $ok = ($rc===0);
+          }
+          if ($local !== $zipPath && !$needPushBack) @unlink($local);
           echo $ok ? "削除に成功しました。" : "エラー: 削除に失敗しました。";
         } else {
           echo "エラー: ファイルが見つかりませんでした。";
@@ -1003,6 +1321,7 @@ if (isset($_GET["ajax-typeof"]) || isset($_GET["ajaxtypeof"])) {
         http_response_code(404);
         echo "CommandNotFoundException";
     }
+
   } catch (Throwable $e) {
     http_response_code(500);
     header("Content-Type: text/plain; charset=utf-8");
@@ -1532,24 +1851,40 @@ function term2_tmux_path(): ?string {
   return $p && is_file($p) ? $p : null;
 }
 function term2_err($msg){ return ['ok'=>false, 'error'=>$msg]; }
+
 function term2_list(): array {
   term2_ensure_session();
-  $tabs = $_SESSION['atk_term2']['tabs'] ?? [];
+
   $tmux = term2_tmux_path();
+  $tabs = [];
+
   if ($tmux) {
-    foreach ($tabs as $sid => $t) {
-      $name = $t['name'] ?? '';
-      if ($name === '') { unset($tabs[$sid]); continue; }
-      $out = []; $rc = 0; @exec($tmux.' has-session -t '.escapeshellarg($name).' 2>/dev/null', $out, $rc);
-      if ($rc !== 0) unset($tabs[$sid]);
+    $out = [];
+    $rc  = 0;
+    exec_sudo($tmux . ' list-sessions -F "#{session_name}" 2>/dev/null', $out, $rc);
+    if ($rc === 0 && is_array($out)) {
+      foreach ($out as $nmRaw) {
+        $nm = trim($nmRaw);
+        if ($nm !== '' && preg_match('/^atkfm_([A-Za-z0-9]{4,64})$/', $nm, $m)) {
+          $sid = $m[1];
+          $tabs[$sid] = [
+            'name'   => $nm,
+            'label'  => $nm,
+            'created'=> null,
+            'hist_lines'=> 0,
+          ];
+        }
+      }
     }
   }
+
   $_SESSION['atk_term2']['tabs'] = $tabs;
+
   $outTabs = [];
-  foreach ($tabs as $sid=>$t) {
-    $outTabs[] = ['id'=>$sid, 'label'=>$t['label'] ?? $sid];
+  foreach ($tabs as $sid => $t) {
+    $outTabs[] = ['id' => $sid, 'label' => $t['label'] ?? $sid];
   }
-  return ['ok'=>true, 'tabs'=>$outTabs];
+  return ['ok' => true, 'tabs' => $outTabs];
 }
 
 function term2_open(int $cols, int $rows): array {
@@ -1568,11 +1903,11 @@ function term2_open(int $cols, int $rows): array {
 
   $cmd    = 'sh -lc '.escapeshellarg('export TERM=xterm-256color; export PS1="'.$ps1.'"; exec '.escapeshellarg($shell).' -i -l');
   $create = $tmux.' new-session -d -s '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' -c '.escapeshellarg($cwd).' '.$cmd.' 2>&1';
-  $out = []; $rc = 0; @exec($create, $out, $rc);
+  $out = []; $rc = 0; exec_sudo($create, $out, $rc);
   if ($rc !== 0) return term2_err('tmux new-session 失敗: '.implode("\n",$out));
-  @exec($tmux.' set-option  -t '.escapeshellarg($name).' status off 2>&1');
-  @exec($tmux.' set-option  -t '.escapeshellarg($name).' window-size manual 2>&1');
-  @exec($tmux.' resize-window -t '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' 2>&1');
+  exec_sudo($tmux.' set-option  -t '.escapeshellarg($name).' status off 2>&1', $out, $rc);
+  exec_sudo($tmux.' set-option  -t '.escapeshellarg($name).' window-size manual 2>&1', $out, $rc);
+  exec_sudo($tmux.' resize-window -t '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' 2>&1', $out, $rc);
 
   $_SESSION['atk_term2']['tabs'][$sid] = [
     'name'=>$name,
@@ -1584,10 +1919,23 @@ function term2_open(int $cols, int $rows): array {
 }
 
 function term2_validate_sid(string $sid): ?string {
-  term2_ensure_session();
-  if (!preg_match('/^[A-Za-z0-9]+$/', $sid)) return null;
-  $t = $_SESSION['atk_term2']['tabs'][$sid] ?? null;
-  return $t['name'] ?? null;
+  if (!preg_match('/^[A-Za-z0-9]{4,64}$/', $sid)) {
+    return null;
+  }
+  $tmux = term2_tmux_path();
+  if (!$tmux) {
+    return null;
+  }
+
+  $name = 'atkfm_' . $sid;
+
+  $out = [];
+  $rc  = 0;
+  exec_sudo($tmux . ' has-session -t ' . escapeshellarg($name) . ' 2>/dev/null', $out, $rc);
+  if ($rc !== 0) {
+    return null;
+  }
+  return $name;
 }
 
 function term2_read(string $sid): array {
@@ -1599,7 +1947,7 @@ function term2_read(string $sid): array {
 
   $fmt = '#{pane_height} #{pane_width} #{cursor_y} #{cursor_x}';
   $o = []; $rc = 0;
-  @exec($tmux.' display-message -p -t '.escapeshellarg($name).' "'.$fmt.'" 2>/dev/null', $o, $rc);
+  exec_sudo($tmux.' display-message -p -t '.escapeshellarg($name).' "'.$fmt.'" 2>/dev/null', $o, $rc);
   $h=$w=$cy=$cx = 0;
   if ($rc===0 && !empty($o)) {
     $parts = preg_split('/\s+/', trim($o[0]));
@@ -1613,7 +1961,7 @@ function term2_read(string $sid): array {
 
   $lines = []; $rc = 0;
   $cap = $tmux.' capture-pane -p -e -J -t '.escapeshellarg($name).' -S - -E -';
-  @exec($cap.' 2>/dev/null', $lines, $rc);
+  exec_sudo($cap.' 2>/dev/null', $lines, $rc);
   if ($rc !== 0 || !is_array($lines)) $lines = [];
 
   if (count($lines) > $h) {
@@ -1624,7 +1972,6 @@ function term2_read(string $sid): array {
   }
 
   $txt = implode("\n", $lines);
-
   if ($txt !== '') {
     $txt = str_replace("\x0c", "", $txt);
   }
@@ -1649,14 +1996,13 @@ function term2_write(string $sid, string $b64): array {
   $data = base64_decode($b64, true);
   if ($data===false) return term2_err('bad base64');
 
-  // 任意バイトをそのまま注入する
   $tmp = tempnam(sys_get_temp_dir(), 'atkfm_term_');
   file_put_contents($tmp, $data);
   $buf = 'atkfm_buf_'.$sid.'_'.bin2hex(random_bytes(2));
   $out=[]; $rc=0;
-  @exec($tmux.' load-buffer -b '.escapeshellarg($buf).' '.escapeshellarg($tmp).' 2>&1', $out, $rc);
-  if ($rc===0) @exec($tmux.' paste-buffer -t '.escapeshellarg($name).' -b '.escapeshellarg($buf).' 2>&1', $out, $rc);
-  @exec($tmux.' delete-buffer -b '.escapeshellarg($buf).' 2>&1');
+  exec_sudo($tmux.' load-buffer -b '.escapeshellarg($buf).' '.escapeshellarg($tmp).' 2>&1', $out, $rc);
+  if ($rc===0) exec_sudo($tmux.' paste-buffer -t '.escapeshellarg($name).' -b '.escapeshellarg($buf).' 2>&1', $out, $rc);
+  exec_sudo($tmux.' delete-buffer -b '.escapeshellarg($buf).' 2>&1', $out, $rc);
   @unlink($tmp);
   if ($rc!==0) return term2_err('write failed');
   return ['ok'=>true];
@@ -1670,7 +2016,7 @@ function term2_resize(string $sid, int $cols, int $rows): array {
   if (!$name) return term2_err('invalid sid');
 
   $out=[]; $rc=0;
-  @exec($tmux.' resize-window -t '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' 2>&1', $out, $rc);
+  exec_sudo($tmux.' resize-window -t '.escapeshellarg($name).' -x '.(int)$cols.' -y '.(int)$rows.' 2>&1', $out, $rc);
   return $rc===0 ? ['ok'=>true] : term2_err('resize failed: '.implode("\n",$out));
 }
 
@@ -1681,7 +2027,7 @@ function term2_close(string $sid): array {
   $name = term2_validate_sid($sid);
   if (!$name) return term2_err('invalid sid');
 
-  $out=[]; $rc=0; @exec($tmux.' kill-session -t '.escapeshellarg($name).' 2>&1', $out, $rc);
+  $out=[]; $rc=0; exec_sudo($tmux.' kill-session -t '.escapeshellarg($name).' 2>&1', $out, $rc);
   term2_ensure_session();
   unset($_SESSION['atk_term2']['tabs'][$sid]);
   return ['ok'=> $rc===0];
@@ -1710,7 +2056,6 @@ function term_run(string $sid, string $input, int $cols = 120, int $rows = 30): 
     return ['ok'=>false, 'error'=>'notfound'];
   }
 
-  // 必要情報を確保して即セッションロック解放
   $t = $_SESSION['atk_term']['tabs'][$sid];
   $cwd = $t['cwd'];
   $cmd = trim($input);
@@ -1737,7 +2082,9 @@ function term_run(string $sid, string $input, int $cols = 120, int $rows = 30): 
     $proc = @proc_open($cm.' /C '.$wrapped, $des, $pipes, $cwd);
   } else {
     $shell = default_shell();
-    $proc  = @proc_open($shell.' -lc '.escapeshellarg($wrapped), $des, $pipes, $cwd, $env);
+    $cmdline = $shell.' -lc '.escapeshellarg($wrapped);
+    // RUN_AS_ROOT なら sudo で昇格
+    $proc  = proc_open_sudo_linux($cmdline, $des, $pipes, $cwd, $env);
   }
 
   if (!is_resource($proc)) {
@@ -1763,7 +2110,7 @@ function term_run(string $sid, string $input, int $cols = 120, int $rows = 30): 
     if ($r2 !== false && $r2 !== '') $buf .= $r2;
 
     if (!$running) break;
-    usleep(100000); // 100ms
+    usleep(100000);
   }
 
   if (is_resource($pipes[1])) fclose($pipes[1]);
@@ -2110,6 +2457,9 @@ function ViewNotePad($filepath)
 
   // テキストファイルの場合はエディタで開く
   $raw = @file_get_contents($filepath);
+  if ($raw === false && app_run_as_root_enabled()) {
+    $raw = root_fs_read($filepath);
+  }
   if ($raw === false) {
     $raw = "// ファイルが見つかりませんでした。";
   }
@@ -2744,7 +3094,7 @@ $IS_WINDOWS = is_windows();
           <option value="18">18px</option>
           <option value="20">20px</option>
         </select>
-        <button type="button" id="term-newtab" class="atkfm-btn" onclick="term.newTab()">+ 新しいタブ</button>
+        <button type="button" id="term-newtab" class="atkfm-btn">+ 新しいタブ</button>
       </div>
     </div>
   </div>
@@ -2785,6 +3135,18 @@ $IS_WINDOWS = is_windows();
     </div>
     <div id="cfg-ip-me" class="text-xs text-slate-400 mt-1"></div>
     <div class="text-xs text-slate-400 mb-2">※Cloudflare等のCDN利用時にはこの設定は使用できません。</div>
+  </div>
+
+  <div class="p-4 rounded border border-slate-800 bg-slate-800/40">
+    <div class="text-sm text-slate-300 mb-3">権限設定</div>
+    <div class="flex items-center gap-3">
+      <input type="checkbox" id="cfg-run-root" class="w-4 h-4">
+      <label for="cfg-run-root" class="text-slate-200">WebTaskmgrをroot権限で実行する</label>
+    </div>
+    <div id="cfg-run-root-info" class="text-sm text-slate-300 mt-2"></div>
+    <div class="text-xs text-amber-300 mt-2">
+      <p class="text-xs text-slate-400 mb-2">※有効化する場合には、以下をvisudoコマンドでsudoersに追加してください。</p>      <code id="cfg-sudoers-example" class="bg-slate-900 px-2 py-1 rounded border border-slate-700"></code>
+    </div>
   </div>
 
   <div class="p-4 rounded border border-slate-800 bg-slate-800/40">
@@ -2855,6 +3217,19 @@ const state = {
 const fmtPct = v => (v==null||isNaN(v)) ? '--%' : (v.toFixed(1)+'%');
 const fmtMiB = kb => (kb==null) ? '--' : (kb/1024).toFixed(1)+' MiB';
 const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+
+function utf8ToBase64(str){
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function base64ToUtf8(b64){
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+}
 
 function ringPush(arr, v, maxN) {
   arr.push(v);
@@ -3151,7 +3526,6 @@ function renderOverview(j) {
 
   const l1 = j.loadavg ? j.loadavg['1'] : null;
   loadText.textContent = `${l1 ?? '--'} / ${j.loadavg ? j.loadavg['5'] : '--'} / ${j.loadavg ? j.loadavg['15'] : '--'}`;
-
   ringPush(state.series.load1, l1 || 0, state.seriesMaxPoints);
 
   const yMaxLoad = Math.max(1, (cores?.length || 1));
@@ -3645,6 +4019,8 @@ document.getElementById('fm-list').addEventListener('click', (e) => fm.handleLis
 const cfg = {
   hasPassword: false,
   me: '',
+  runAsRoot: false,
+  serverUser: '',
 
   async load() {
     try {
@@ -3654,6 +4030,8 @@ const cfg = {
 
       this.hasPassword = !!j.hasPassword;
       this.me = j.clientIp || '';
+      this.runAsRoot = !!j.runAsRoot;
+      this.serverUser = j.serverUser || '';
 
       const ta = document.getElementById('cfg-ip-allow');
       if (ta) ta.value = (j.ipAllow || []).join('\n');
@@ -3666,6 +4044,18 @@ const cfg = {
 
       const passInfo = document.getElementById('cfg-pass-info');
       if (passInfo) passInfo.textContent = '';
+
+      const cbRoot = document.getElementById('cfg-run-root');
+      if (cbRoot) cbRoot.checked = this.runAsRoot;
+
+      const ex = document.getElementById('cfg-sudoers-example');
+      if (ex) {
+        const u = (this.serverUser || 'apache');
+        ex.textContent = `${u} ALL=(ALL) NOPASSWD: /bin/*, /usr/bin/*, /usr/sbin/*`;
+      }
+
+      const info = document.getElementById('cfg-run-root-info');
+      if (info) info.textContent = this.runAsRoot ? '現在: root 権限で動作（tmux/シェル）' : '現在: 通常権限で動作';
     } catch {
       const passInfo = document.getElementById('cfg-pass-info');
       if (passInfo) passInfo.textContent = '設定の取得に失敗しました。';
@@ -3718,12 +4108,35 @@ const cfg = {
       if (info) info.textContent = 'エラー: 通信に失敗しました。';
     }
   },
+
+  async saveRunRoot() {
+    const cb = document.getElementById('cfg-run-root');
+    const info = document.getElementById('cfg-run-root-info');
+    if (info) info.textContent = '保存中…';
+    try {
+      const r = await fetch('?action=config-set', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ change: 'run-as-root', enabled: !!cb.checked })
+      });
+      const j = await r.json();
+      if (j.ok) {
+        this.runAsRoot = !!j.runAsRoot;
+        if (info) info.textContent = this.runAsRoot ? '現在: root 権限で動作（tmux/シェル）' : '現在: 通常権限で動作';
+      } else {
+        if (info) info.textContent = 'エラー: ' + (j.error || '失敗しました');
+        cb.checked = !cb.checked; // ロールバック
+      }
+    } catch {
+      if (info) info.textContent = 'エラー: 通信に失敗しました。';
+      cb.checked = !cb.checked; // ロールバック
+    }
+  },
 };
 
 document.getElementById('cfg-pass-save').addEventListener('click', () => cfg.savePassword(false));
 document.getElementById('cfg-pass-clear').addEventListener('click', () => cfg.savePassword(true));
 document.getElementById('cfg-ip-save').addEventListener('click', () => cfg.saveIp());
-
 document.getElementById('cfg-ip-add-self').addEventListener('click', () => {
   if (!cfg.me) return;
   const ta = document.getElementById('cfg-ip-allow');
@@ -3733,6 +4146,8 @@ document.getElementById('cfg-ip-add-self').addEventListener('click', () => {
     ta.value = lines.join('\n');
   }
 });
+const cbRootEl = document.getElementById('cfg-run-root');
+if (cbRootEl) cbRootEl.addEventListener('change', () => cfg.saveRunRoot());
 
 renderStaticSpecs();
 
@@ -3839,19 +4254,21 @@ const term = {
   },
 
   _renderCapture(out_b64, cy, cx, h, w){
-    const raw = atob(out_b64).replace(/\x0c/g, '');
+    const raw = base64ToUtf8(out_b64).replace(/\x1c|\x1d|\x1e|\x1f|\x0c/g, ''); // \x0c は既存同様、他の不可視制御も念のため除去
     const lines = raw.split('\n');
 
     const height = Math.max(1, h|0);
     const width  = Math.max(1, w|0);
 
-    let esc = '\x1b[H\x1b[2J';
+    let esc = '\x1b[0m\x1b[H\x1b[2J';
 
     for (let i = 0; i < height; i++){
       const ln = lines[i] ?? '';
       const clipped = ln.length > width ? ln.slice(0, width) : ln;
-      esc += `\x1b[${i+1};1H${clipped}\x1b[K`;
+      esc += `\x1b[${i+1};1H${clipped}\x1b[0m\x1b[K`;
     }
+
+    esc += '\x1b[0m';
 
     if (Number.isInteger(cy) && Number.isInteger(cx)){
       esc += `\x1b[${(cy|0)+1};${(cx|0)+1}H`;
@@ -3941,11 +4358,10 @@ const term = {
     const j = await this._fetchJSON('?action=term2-write', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ sid:this.active, data_b64: btoa(chunk) })
+      body: JSON.stringify({ sid:this.active, data_b64: utf8ToBase64(chunk) })
     }).catch(e=>this._err('write error: '+e.message));
     if (j && !j.ok) this._err(j.error||'write failed');
   },
-
   async _tryOpenTmux(){
     try{
       const cols = this.xterm.cols || 120, rows = this.xterm.rows || 30;
@@ -4130,8 +4546,14 @@ const term = {
       const j = await this._fetchJSON('?action=term-run', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ sid:this.basicSid||'', input:cmd, cols:this.xterm.cols||120, rows:this.xterm.rows||30 })
+        body: JSON.stringify({
+          sid:this.basicSid||'',
+          input:cmd,
+          cols:this.xterm.cols||120,
+          rows:this.xterm.rows||30
+        })
       });
+
       if (j?.ok){
         if (typeof j.out==='string' && j.out.length){
           this.xterm.write(j.out.replace(/\n/g,'\r\n'));
@@ -4141,7 +4563,10 @@ const term = {
       } else {
         this._err(j?.error||'command failed');
       }
-    }catch(e){ this._err('network error: '+e.message); }
+    } catch(e){
+      this._err('network error: '+e.message);
+    }
+    this.xterm.write('\x1b[0m');
     this._writePrompt();
   },
 
